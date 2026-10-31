@@ -1,17 +1,22 @@
-// MM Mega Market catalog: the two proven GraphQL stages only, per the 2026-10-31 capture
-// (mm-search-contract.json, guest store b2c_10010_vi, HTTP 200 via native fetch GET +
-// header store, no cookies): ProductSearch (render_stage CARD) lists products, then
+// MM Mega Market catalog: two proven contracts only, per the 2026-10-31 captures (guest
+// store b2c_10010_vi, HTTP 200 via native fetch GET + header store, no cookies).
+// Search (mm-search-contract.json): ProductSearch (render_stage CARD) lists products, then
 // ProductSearchEnrich (render_stage ENRICH) prices the exact SKUs CARD returned, joined
-// by exact sku. Query strings below are the captured strings, verbatim; variables are
-// JSON-serialized per call and never built by string interpolation.
+// by exact sku. Detail (mm-detail-verified.json): the ProductPage query asks products by
+// exact url_key with show_disabled:true and answers exactly one item. Detail is NOT
+// search-as-detail: the earlier proof path (CARD with filter sku:{eq:...} and an empty
+// search) was replayed and that filter is ignored upstream (the full 13k+ catalog comes
+// back, first item unrelated), so the search contract could not carry exact detail.
+// Query strings below are the captured strings, verbatim; variables are JSON-serialized
+// per call and never built by string interpolation.
 // Guest only: prices are catalog-observed, not guaranteed payable.
-// mm_get_product is intentionally absent, not stubbed: the proof path (CARD request with
-// filter sku:{eq:...}, empty search) was replayed and the filter is ignored upstream
-// (returns the full 13k+ catalog, first item unrelated), so exact per-SKU detail is not
-// a proven contract; search-by-sku would be search-as-detail, out of contract.
 
 const GRAPHQL_URL = "https://online.mmvietnam.com/graphql";
 const STORE_RE = /^b2c_[0-9]{1,8}_vi$/;
+// url_key is a slug: ascii label chars only, so slash, query/fragment ('?', '&', '%'),
+// whitespace and every control character are rejected before any request is made.
+const URL_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
+const SKU_MAX = 64;
 const PAGE_SIZES = [10, 20, 24, 50];
 const TIMEOUT_MS = 25000;
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
@@ -20,6 +25,11 @@ const PRICE_STATUS = "catalog-observed-not-guaranteed-payable";
 // Verbatim from the 2026-10-31 capture (mm-search-contract.json), checked in.
 export const CARD_QUERY = "query ProductSearch($currentPage:Int=1$inputText:String!$pageSize:Int=24$filters:ProductAttributeFilterInput!$sort:ProductAttributeSortInput$asmUid:String$phoneNumber:String){products(currentPage:$currentPage pageSize:$pageSize search:$inputText filter:$filters sort:$sort asm_uid:$asmUid phone_number:$phoneNumber render_stage:CARD){items{...ProductDisplayFragment tracking_url __typename}is_use_smart_search cdp_filter{label count attribute_code options{label value __typename}position __typename}aggregations{label count attribute_code options{label value __typename}position __typename}page_info{total_pages __typename}total_count __typename}}fragment ProductDisplayFragment on ProductInterface{id uid sku name ecom_name is_alcohol allow_pickup mis_stock{status label max_qty can_add_to_cart unavailable_reason notice __typename}mm_product_type mm_qty_step unit_ecom url_suffix art_no small_image{url __typename}rating_summary stock_status url_key canonical_url __typename}";
 export const ENRICH_QUERY = "query ProductSearchEnrich($skus:[String]!$pageSize:Int=24$asmUid:String$phoneNumber:String){products(pageSize:$pageSize filter:{sku:{in:$skus}}asm_uid:$asmUid phone_number:$phoneNumber render_stage:ENRICH){items{...ProductEnrichFragment __typename}__typename}}fragment ProductEnrichFragment on ProductInterface{id uid sku categories{uid breadcrumbs{category_uid __typename}name __typename}dnr_price_search_page{event_id event_name __typename}dnr_mcard{event_id event_name promo_type promo_value cta __typename}price{regularPrice{amount{value currency __typename}__typename}__typename}price_range{maximum_price{final_price{currency value __typename}regular_price{currency value __typename}discount{amount_off __typename}__typename}__typename}product_label{label_id label_description label_name label_status label_from_date label_to_date label_priority label_type stores customer_groups product_image{type url position display text text_color text_font text_size shape_type shape_color label_size label_size_mobile custom_css use_default __typename}category_image{type url position display text text_color text_font text_size shape_type shape_color label_size label_size_mobile custom_css __typename}__typename}__typename}";
+
+// Verbatim from the 2026-10-31 ProductPage capture (mm-detail-verified.json), checked in:
+// the real product page asks by exact url_key (show_disabled), it is NOT the search
+// contract above. One exact url_key -> at most one product; anything else fails closed.
+export const DETAIL_QUERY = "query getProductDetailForProductPage($urlKey:String!){products(filter:{url_key:{eq:$urlKey}}show_disabled:true){items{id uid ...ProductDetailsFragment __typename}__typename}}fragment ProductDetailsFragment on ProductInterface{__typename categories{uid breadcrumbs{category_uid __typename}name __typename}main_category{uid id name breadcrumbs{category_uid category_level category_name category_url_key category_url_path __typename}__typename}description{html __typename}short_description{html __typename}id uid is_alcohol allow_pickup media_gallery_entries{uid label position disabled file video_content{video_url video_title __typename}__typename}meta_description url_suffix name ecom_name mis_stock{status label max_qty can_add_to_cart unavailable_reason notice __typename}mm_product_type mm_qty_step unit_ecom mm_brand dnr_price{qty promo_label promo_type promo_amount promo_value event_id event_name __typename}dnr_mcard{event_id event_name promo_type promo_value cta __typename}art_no price{regularPrice{amount{currency value __typename}__typename}__typename}price_range{maximum_price{final_price{currency value __typename}discount{amount_off percent_off __typename}__typename}__typename}sku small_image{url __typename}stock_status url_key canonical_url product_label{label_id label_description label_name label_status label_from_date label_to_date label_priority label_type stores customer_groups product_image{type url position display text text_color text_font text_size shape_type shape_color label_size label_size_mobile custom_css use_default __typename}category_image{type url position display text text_color text_font text_size shape_type shape_color label_size label_size_mobile custom_css __typename}__typename}rating_summary review_count reviews{items{average_rating ratings_breakdown{name value __typename}__typename}__typename}similar_products{uid sku name price_range{maximum_price{final_price{currency value __typename}regular_price{currency value __typename}discount{amount_off __typename}__typename}__typename}small_image{url __typename}url_key __typename}custom_attributes{selected_attribute_options{attribute_option{uid label is_default __typename}__typename}entered_attribute_value{value __typename}attribute_metadata{uid code label attribute_labels{store_code label __typename}data_type is_system entity_type ui_input{ui_input_type is_html_allowed __typename}...on ProductAttributeMetadata{used_in_components __typename}__typename}__typename}additional_attributes{attribute_code label value __typename}...on ConfigurableProduct{configurable_options{attribute_code attribute_id uid label values{uid default_label label store_label use_default_value value_index swatch_data{...on ImageSwatchData{thumbnail __typename}value __typename}__typename}__typename}variants{attributes{code value_index __typename}product{uid media_gallery_entries{uid disabled file label position __typename}sku stock_status price{regularPrice{amount{currency value __typename}__typename}__typename}price_range{maximum_price{final_price{currency value __typename}discount{amount_off __typename}__typename}__typename}custom_attributes{selected_attribute_options{attribute_option{uid label is_default __typename}__typename}entered_attribute_value{value __typename}attribute_metadata{uid code label attribute_labels{store_code label __typename}data_type is_system entity_type ui_input{ui_input_type is_html_allowed __typename}...on ProductAttributeMetadata{used_in_components __typename}__typename}__typename}__typename}__typename}__typename}}";
 
 export const TOOLS = [
   {
@@ -42,6 +52,28 @@ export const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "mm_get_product",
+    description:
+      "Exact detail for one MM Mega Market product (guest view, one explicit store). " +
+      "Runs the captured ProductPage query: products(filter:{url_key:{eq:<url_key>}}, " +
+      "show_disabled:true) — an exact url_key lookup, not search. Fails closed unless " +
+      "exactly one product comes back for that url_key (expected_sku, if given, must " +
+      "match it too). Prices are VND, catalog-observed and NOT guaranteed payable " +
+      "(price_vnd is the observed final price, regular_price_vnd the regular one); " +
+      "promotion and member_offer are raw offer data, never your payable price. " +
+      "stock_status is a label, not an inventory count or purchasability guarantee. " +
+      "No cart, no auth.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url_key: { type: "string", minLength: 1, maxLength: 200, description: "exact product url_key (slug): [A-Za-z0-9._-] only, no slash, query/fragment or control characters" },
+        expected_sku: { type: "string", minLength: 1, maxLength: 64, description: "optional exact SKU; the call fails closed if the matched product's SKU differs" },
+      },
+      required: ["url_key"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -61,6 +93,14 @@ class CatalogError extends Error {
 }
 
 export function createCatalog({ fetchImpl = globalThis.fetch, env = process.env } = {}) {
+  // Guest view of exactly one configured store: no default, no fallback, no auth.
+  function guestStore() {
+    const storeCode = env.MM_STORE_CODE;
+    if (typeof storeCode !== "string" || storeCode === "") throw new CatalogError("MISSING_STORE_ENV", "MM_STORE_CODE is required, no default");
+    if (!STORE_RE.test(storeCode)) throw new CatalogError("INVALID_STORE_CODE");
+    return storeCode;
+  }
+
   // One complete stage request -> parsed GraphQL data object. Any transport/status/size/
   // JSON/graphql failure is a CatalogError; the response stream is always drained
   // (cancelled and awaited) before throwing so nothing dangles (no unhandled rejections,
@@ -149,9 +189,7 @@ export function createCatalog({ fetchImpl = globalThis.fetch, env = process.env 
   // CARD stage -> exact SKUs -> ENRICH stage -> join by exact sku -> public projection.
   async function search(rawArgs) {
     const { query, pageIndex, pageSize } = validateArgs(rawArgs);
-    const storeCode = env.MM_STORE_CODE;
-    if (typeof storeCode !== "string" || storeCode === "") throw new CatalogError("MISSING_STORE_ENV", "MM_STORE_CODE is required, no default");
-    if (!STORE_RE.test(storeCode)) throw new CatalogError("INVALID_STORE_CODE");
+    const storeCode = guestStore();
 
     const cardData = await gql(CARD_QUERY, {
       currentPage: pageIndex + 1, // observed upstream paging is 1-based
@@ -225,10 +263,78 @@ export function createCatalog({ fetchImpl = globalThis.fetch, env = process.env 
     return envelope(listed);
   }
 
+  // Exact detail for one url_key: captured ProductPage contract (exact filter,
+  // show_disabled:true). Zero matches -> PRODUCT_NOT_FOUND, more than one -> fail closed;
+  // a returned product under a different url_key is not the requested one. Guest store:
+  // nothing here is a payable-price, stock-count or purchasability claim.
+  function validateDetailArgs(raw) {
+    if (!isObj(raw)) throw new CatalogError("INVALID_ARGS", "arguments must be an object");
+    const unknown = Object.keys(raw).filter((k) => !["url_key", "expected_sku"].includes(k));
+    if (unknown.length) throw new CatalogError("INVALID_ARGS", `unknown argument(s): ${unknown.join(", ")}`);
+    const urlKey = raw.url_key;
+    if (typeof urlKey !== "string" || !URL_KEY_RE.test(urlKey)) {
+      throw new CatalogError("INVALID_ARGS", "url_key must be a 1-200 char slug ([A-Za-z0-9._-]), no slash/query/control characters");
+    }
+    let expectedSku = null;
+    if ("expected_sku" in raw) {
+      const s = raw.expected_sku;
+      if (typeof s !== "string" || s.length < 1 || s.length > SKU_MAX || hasControl(s)) {
+        throw new CatalogError("INVALID_ARGS", `expected_sku must be a 1-${SKU_MAX} char string without control characters`);
+      }
+      expectedSku = s;
+    }
+    return { urlKey, expectedSku };
+  }
+
+  async function productDetail(rawArgs) {
+    const { urlKey, expectedSku } = validateDetailArgs(rawArgs);
+    const storeCode = guestStore();
+    const data = await gql(DETAIL_QUERY, { urlKey }, storeCode); // JSON variables only, never interpolated
+    const products = data.products;
+    if (!isObj(products) || !Array.isArray(products.items)) throw new CatalogError("BAD_UPSTREAM_DATA", "products.items");
+    if (products.items.length === 0) throw new CatalogError("PRODUCT_NOT_FOUND", `no product for url_key ${urlKey}`);
+    if (products.items.length > 1) throw new CatalogError("MULTIPLE_PRODUCTS", `${products.items.length} products for one exact url_key`);
+    const it = products.items[0];
+    if (!isObj(it)) throw new CatalogError("BAD_UPSTREAM_DATA", "product item");
+    if (it.url_key !== urlKey) throw new CatalogError("PRODUCT_NOT_FOUND", "returned url_key is not the requested one");
+    if (!isInt(it.id, 0, Number.MAX_SAFE_INTEGER)) throw new CatalogError("BAD_UPSTREAM_DATA", "product id");
+    if (typeof it.sku !== "string" || it.sku === "") throw new CatalogError("BAD_UPSTREAM_DATA", "product sku");
+    if (expectedSku !== null && it.sku !== expectedSku) throw new CatalogError("SKU_MISMATCH", `${it.sku} != ${expectedSku}`);
+    if (typeof it.name !== "string" || it.name === "") throw new CatalogError("BAD_UPSTREAM_DATA", "product name");
+    if (typeof it.unit_ecom !== "string" || it.unit_ecom === "") throw new CatalogError("BAD_UPSTREAM_DATA", "product unit_ecom");
+    if (!isInt(it.mm_qty_step, 1, Number.MAX_SAFE_INTEGER)) throw new CatalogError("BAD_UPSTREAM_DATA", "product mm_qty_step");
+    if (typeof it.stock_status !== "string" || it.stock_status === "") throw new CatalogError("BAD_UPSTREAM_DATA", "product stock_status");
+    const reg = isObj(it.price) && isObj(it.price.regularPrice) ? it.price.regularPrice.amount : null;
+    const mp = isObj(it.price_range) ? it.price_range.maximum_price : null;
+    const fin = isObj(mp) ? mp.final_price : null;
+    if (!moneyOk(reg) || !moneyOk(fin)) throw new CatalogError("PRICE_INVALID", `${it.sku} malformed price`);
+    if (fin.value > reg.value) throw new CatalogError("PRICE_INVALID", `${it.sku} final above regular`);
+    return {
+      product: {
+        id: it.id,
+        sku: it.sku,
+        name: it.name,
+        url_key: it.url_key,
+        unit: it.unit_ecom,
+        quantity_step: it.mm_qty_step,
+        stock_status: it.stock_status,
+        price_vnd: fin.value,
+        regular_price_vnd: reg.value,
+        promotion: Array.isArray(it.dnr_price) ? it.dnr_price : null, // raw tier offers, not payable
+        member_offer: isObj(it.dnr_mcard) ? it.dnr_mcard : null, // raw MCard offer, guest never sees a payable member price
+      },
+      context: { store_code: storeCode, authenticated: false },
+      price_status: PRICE_STATUS,
+      observed_at: new Date().toISOString(),
+    };
+  }
+
   async function callTool(name, args) {
     try {
-      if (name !== "mm_search_products") throw new CatalogError("UNKNOWN_TOOL", String(name));
-      const projection = await search(args);
+      let projection;
+      if (name === "mm_search_products") projection = await search(args);
+      else if (name === "mm_get_product") projection = await productDetail(args);
+      else throw new CatalogError("UNKNOWN_TOOL", String(name));
       return { content: [{ type: "text", text: JSON.stringify(projection) }] };
     } catch (e) {
       const code = e instanceof CatalogError ? e.code : "INTERNAL";
