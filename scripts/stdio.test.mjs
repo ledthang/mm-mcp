@@ -194,7 +194,8 @@ async function main() {
   await t("tools/list default params then cursor: catalog+account tools, no cursor", async () => {
     const c = await live();
     const a = await c.call({ jsonrpc: "2.0", id: 16, method: "tools/list" });
-    assert.deepEqual(a.result.tools.map((t) => t.name), ["mm_search_products", "mm_auth_status", "mm_get_delivery_context", "mm_list_addresses"]);
+    assert.deepEqual(a.result.tools.map((t) => t.name), ["mm_search_products", "mm_auth_status", "mm_get_delivery_context", "mm_list_addresses", "mm_get_cart", "mm_cart_summary"], "six tools: 1 guest catalog + 5 authenticated read");
+    assert.equal(a.result.tools.length, 6, "exactly six tools on one page");
     assert.ok(a.result.tools.every((t) => t.inputSchema.additionalProperties === false));
     const b = await c.call({ jsonrpc: "2.0", id: 17, method: "tools/list", params: { cursor: "next" } });
     assert.deepEqual(b.result.tools, a.result.tools); // same single page for any cursor string

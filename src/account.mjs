@@ -1,4 +1,4 @@
-// MM Mega Market account: authenticated READ slice only (T3).
+// MM Mega Market account: authenticated READ slice only (T3 + T4a cart read).
 // Proven 2026-10-31 (primary): persistent browser restart stays on /dashboard with
 // successful customer responses; the SPA sends an Authorization header with store
 // b2c_70010_vi. Native fetch, fixed origin, GET with { Authorization, store } headers
@@ -12,9 +12,15 @@
 // logs addresses, and never echoes an upstream body or a raw thrown message — every
 // failure is one fixed code (+ optional safe detail), unknown throws are INTERNAL only.
 //
-// READ only: no login tool (setup uses an existing private session export), no cart,
-// no product detail, no address selection. A saved default_shipping address is stored
-// data — NEVER proof of the delivery address currently selected at cart/checkout.
+// READ only: no login tool (setup uses an existing private session export), no product
+// detail, no address selection. A saved default_shipping address is stored data — NEVER
+// proof of the delivery address currently selected at cart/checkout.
+// Cart (T4a): customerCart is an AUTHENTICATED OWNER LOOKUP — it takes no cart id, so no
+// id argument exists and no cart id is ever emitted (not even fetched). Totals and line
+// prices are upstream-observed, never recalculated here and never a payable guarantee.
+// Shipping is count + method labels only: street/city are withheld, and nothing here
+// proves what address the browser currently has selected (the /checkout/cart/ UI shows a
+// fallback view even while a native cart exists — no UI parity is claimed).
 // Context is live: authenticated:true + observed_at only after an actual upstream
 // customer proof, every call. Guest catalog (catalog.mjs) and authenticated read are
 // separate contexts; catalog stays an explicit guest MM_STORE_CODE view.
@@ -36,6 +42,14 @@ const MAX_BODY_BYTES = 2 * 1024 * 1024;
 // Brace-balanced: customer and storeConfig are SIBLINGS at top level (previous version
 // was one } short, so storeConfig nested inside customer and the document hit EOF).
 export const ACCOUNT_QUERY = "query MMReadProof($currentPage:Int=1$pageSize:Int=20){customer{__typename addressesV2(currentPage:$currentPage pageSize:$pageSize){total_count total_pages addresses{id default_shipping city street custom_attributes{attribute_code value}}}}storeConfig{store_code store_name}}";
+
+// Proven 2026-10-31 (primary, native GET, HTTP 200 — see mm-cart-read-contract.json):
+// customerCart is the authenticated owner's cart, so it takes NO id argument and its id is
+// never fetched or emitted (nothing to leak). Same shape discipline as ACCOUNT_QUERY:
+// customerCart / customer / storeConfig are top-level siblings, values go nowhere near a
+// string template. Observed mutable numbers (2 lines, total_quantity 1.5, 1 shipping
+// address, VND) are NOT baked into the code or the assertions.
+export const CART_QUERY = "query MMCartRead{customerCart{total_quantity items{uid quantity product{sku name} prices{price{value currency}row_total{value currency}}}prices{grand_total{value currency}subtotal_excluding_tax{value currency}}shipping_addresses{selected_shipping_method{method_title amount{value currency}}}}customer{__typename}storeConfig{store_code store_name}}";
 
 export const TOOLS = [
   {
@@ -77,6 +91,33 @@ export const TOOLS = [
       },
       additionalProperties: false,
     },
+  },
+  {
+    name: "mm_get_cart",
+    description:
+      "Authenticated owner's cart, live per call, READ ONLY: nothing here adds, changes or " +
+      "removes a line. customerCart is an owner lookup — there is NO cart id argument and " +
+      "no cart id is ever returned. Takes no arguments. Projects each line as { uid, sku, " +
+      "name, quantity, price_vnd, row_total_vnd } plus { total_quantity, totals, shipping, " +
+      "price_status, context, observed_at }. Shipping shows address count + selected " +
+      "method labels only (street/city withheld; the delivery address currently selected is " +
+      "NOT verified). Prices/totals are upstream-observed, never recalculated, never a " +
+      "payable guarantee. VND only: any other currency, a malformed line or a non-positive " +
+      "quantity fails closed; an empty cart is a valid empty result, while no cart in the " +
+      "reply means not authenticated (REQUIRES_LOGIN).",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "mm_cart_summary",
+    description:
+      "Compact count/total view of the authenticated owner's cart, live per call, READ ONLY: " +
+      "{ line_count, total_quantity, currency, subtotal_excluding_tax_vnd, grand_total_vnd, " +
+      "shipping, price_status, context, observed_at } — no line rows (use mm_get_cart for " +
+      "those), no cart id argument, no cart id exposed. Counts are upstream rows counted " +
+      "here; totals are upstream-observed, never recomputed from the lines, so line totals " +
+      "and grand_total are reported as separate upstream facts, not reconciled. VND only; " +
+      "bad money, a bad row or a missing cart fail closed.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
 ];
 
@@ -168,15 +209,17 @@ export function createAccount({ fetchImpl = globalThis.fetch, env = process.env 
   }
 
   // ---------------------------------------------------------------- one gql request
-  // GET on the fixed origin; credential headers are internal (never echoed). Every
+  // GET on the fixed origin; credential headers are internal (never echoed). ONE
+  // transport for every document (account proof / address page / cart) — a call site
+  // supplies the query text + JSON variables, nothing else. Every
   // transport/status/size/JSON/graphql failure is exactly one fixed code; the response
   // stream is always drained before throwing (nothing dangles, no false success).
   // HTTP 401/403 and any explicit GraphQL authentication category are REQUIRES_LOGIN
   // and stay distinct from transport/timeout/schema failures.
-  async function gql(auth, currentPage, pageSize) {
+  async function gql(auth, query, variables = {}) {
     const url = new URL(GRAPHQL_URL);
-    url.searchParams.set("query", ACCOUNT_QUERY);
-    url.searchParams.set("variables", JSON.stringify({ currentPage, pageSize }));
+    url.searchParams.set("query", query);
+    url.searchParams.set("variables", JSON.stringify(variables));
     let res;
     try {
       res = await fetchImpl(url.toString(), {
@@ -284,6 +327,74 @@ export function createAccount({ fetchImpl = globalThis.fetch, env = process.env 
     return { sc, rows, av };
   }
 
+  // Cart (T4a): owner lookup only — no id argument exists anywhere, so no cart id can be
+  // borrowed from another session. proof() gives the customer proof + store cross-check,
+  // then every quantity and money cell is validated BEFORE anything is shown: a malformed
+  // row/currency/quantity fails closed, a real empty cart is a valid empty result, and a
+  // missing cart is REQUIRES_LOGIN (never a fabricated empty one). Numbers are copied
+  // through untouched — nothing is summed or recomputed here, so no projection can turn an
+  // upstream figure into a claimed payable price or a reconciled subtotal.
+  const cartMoney = (m, label) => {
+    if (!isObj(m) || m.currency !== "VND" || typeof m.value !== "number" || !Number.isFinite(m.value) || m.value < 0) {
+      throw new AccountError("BAD_MONEY", label);
+    }
+    return m.value;
+  };
+  const isQty = (v) => typeof v === "number" && Number.isFinite(v) && v > 0; // decimals allowed (sold by weight)
+
+  function cartProof(data, store) {
+    const sc = proof(data, store); // customer.__typename === "Customer" + store_code cross-check
+    const cart = data.customerCart;
+    if (cart === null || cart === undefined) throw new AccountError("REQUIRES_LOGIN", "HTTP 200 but no customerCart: not authenticated");
+    if (!isObj(cart) || !["total_quantity", "items", "prices", "shipping_addresses"].every((k) => k in cart)) {
+      throw new AccountError("BAD_UPSTREAM_DATA", "customerCart");
+    }
+    const tq = cart.total_quantity; // 0 = real empty cart (valid); negative/NaN/non-number fails closed
+    if (typeof tq !== "number" || !Number.isFinite(tq) || tq < 0) throw new AccountError("BAD_UPSTREAM_DATA", "total_quantity");
+    if (!Array.isArray(cart.items)) throw new AccountError("BAD_UPSTREAM_DATA", "items");
+    const lines = [];
+    for (const it of cart.items) {
+      if (
+        !isObj(it) ||
+        !["uid", "quantity", "product", "prices"].every((k) => k in it) ||
+        !isObj(it.product) || typeof it.product.sku !== "string" || it.product.sku === "" ||
+        typeof it.product.name !== "string" || it.product.name === "" ||
+        !isObj(it.prices)
+      ) {
+        throw new AccountError("BAD_UPSTREAM_DATA", "cart line");
+      }
+      if (!isQty(it.quantity)) throw new AccountError("BAD_UPSTREAM_DATA", "cart line quantity");
+      if (lines.some((r) => r.uid === it.uid)) throw new AccountError("BAD_UPSTREAM_DATA", "duplicate cart line uid");
+      lines.push({
+        uid: it.uid,
+        sku: it.product.sku,
+        name: it.product.name,
+        quantity: it.quantity,
+        price_vnd: cartMoney(it.prices.price, "cart line price"),
+        row_total_vnd: cartMoney(it.prices.row_total, "cart line row_total"),
+      });
+    }
+    const prices = cart.prices;
+    const totals = {
+      subtotal_excluding_tax_vnd: cartMoney(isObj(prices) ? prices.subtotal_excluding_tax : null, "cart subtotal_excluding_tax"),
+      grand_total_vnd: cartMoney(isObj(prices) ? prices.grand_total : null, "cart grand_total"),
+      currency: "VND",
+    };
+    if (!Array.isArray(cart.shipping_addresses)) throw new AccountError("BAD_UPSTREAM_DATA", "shipping_addresses");
+    const methods = [];
+    for (const a of cart.shipping_addresses) {
+      if (!isObj(a) || !("selected_shipping_method" in a)) throw new AccountError("BAD_UPSTREAM_DATA", "shipping address row");
+      const m = a.selected_shipping_method;
+      if (m === null || m === undefined) continue; // nothing chosen there: no label is invented
+      if (!isObj(m) || typeof m.method_title !== "string" || m.method_title === "") {
+        throw new AccountError("BAD_UPSTREAM_DATA", "selected_shipping_method");
+      }
+      if (methods.some((x) => x.method_title === m.method_title)) throw new AccountError("BAD_UPSTREAM_DATA", "duplicate shipping method label");
+      methods.push({ method_title: m.method_title, amount_vnd: cartMoney(m.amount, "shipping method amount") });
+    }
+    return { sc, lines, totals, methods, addressCount: cart.shipping_addresses.length, total_quantity: tq };
+  }
+
   async function callTool(name, args) {
     try {
       if (!TOOLS.some((t) => t.name === name)) throw new AccountError("UNKNOWN_TOOL", String(name));
@@ -293,7 +404,7 @@ export function createAccount({ fetchImpl = globalThis.fetch, env = process.env 
       if (unknown.length) throw new AccountError("INVALID_ARGS", `unknown argument(s): ${unknown.join(", ")}`);
       const auth = await loadAuth(); // any local credential problem: REQUIRES_LOGIN, zero network
       if (name === "mm_auth_status") {
-        const data = await gql(auth, 1, 20); // the proven proof, live, every call
+        const data = await gql(auth, ACCOUNT_QUERY, { currentPage: 1, pageSize: 20 }); // the proven proof, live, every call
         const sc = proof(data, auth.store);
         return {
           content: [{ type: "text", text: JSON.stringify({
@@ -302,7 +413,7 @@ export function createAccount({ fetchImpl = globalThis.fetch, env = process.env 
         };
       }
       if (name === "mm_get_delivery_context") {
-        const data = await gql(auth, 1, 20);
+        const data = await gql(auth, ACCOUNT_QUERY, { currentPage: 1, pageSize: 20 });
         const sc = proof(data, auth.store);
         return {
           content: [{ type: "text", text: JSON.stringify({
@@ -313,23 +424,59 @@ export function createAccount({ fetchImpl = globalThis.fetch, env = process.env 
           }) }],
         };
       }
-      // mm_list_addresses
-      let pageIndex = 0;
-      if ("page_index" in args) {
-        if (!isInt(args.page_index, 0, 40)) throw new AccountError("INVALID_ARGS", "page_index must be an integer 0..40");
-        pageIndex = args.page_index;
+      if (name === "mm_list_addresses") {
+        let pageIndex = 0;
+        if ("page_index" in args) {
+          if (!isInt(args.page_index, 0, 40)) throw new AccountError("INVALID_ARGS", "page_index must be an integer 0..40");
+          pageIndex = args.page_index;
+        }
+        let pageSize = 20;
+        if ("page_size" in args) {
+          if (!isInt(args.page_size, 1, 20)) throw new AccountError("INVALID_ARGS", "page_size must be an integer 1..20");
+          pageSize = args.page_size;
+        }
+        const data = await gql(auth, ACCOUNT_QUERY, { currentPage: pageIndex + 1, pageSize }); // translated only through JSON vars
+        const { sc, rows, av } = pageProof(data, auth.store);
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            addresses: rows,
+            pagination: { page_index: pageIndex, page_size: pageSize, total_count: av.total_count, total_pages: av.total_pages },
+            context: { store_code: sc.store_code, authenticated: true },
+            observed_at: new Date().toISOString(),
+          }) }],
+        };
       }
-      let pageSize = 20;
-      if ("page_size" in args) {
-        if (!isInt(args.page_size, 1, 20)) throw new AccountError("INVALID_ARGS", "page_size must be an integer 1..20");
-        pageSize = args.page_size;
+      // mm_get_cart / mm_cart_summary: one document, no variables, the same transport as
+      // the account proof — an owner lookup takes nothing from the caller by design.
+      const { sc, lines, totals, methods, addressCount, total_quantity: totalQty } =
+        cartProof(await gql(auth, CART_QUERY, {}), auth.store);
+      const shipping = {
+        address_count: addressCount,
+        selected_methods: methods,
+        note: "count + method labels only: street/city withheld, and the delivery address currently selected in cart/checkout is NOT verified here",
+      };
+      if (name === "mm_cart_summary") {
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            line_count: lines.length,
+            total_quantity: totalQty,
+            currency: "VND",
+            subtotal_excluding_tax_vnd: totals.subtotal_excluding_tax_vnd,
+            grand_total_vnd: totals.grand_total_vnd,
+            shipping,
+            price_status: "cart-observed-not-guaranteed-payable: totals copied from upstream, not recomputed from the lines",
+            context: { store_code: sc.store_code, authenticated: true },
+            observed_at: new Date().toISOString(),
+          }) }],
+        };
       }
-      const data = await gql(auth, pageIndex + 1, pageSize); // translated only through JSON vars
-      const { sc, rows, av } = pageProof(data, auth.store);
       return {
         content: [{ type: "text", text: JSON.stringify({
-          addresses: rows,
-          pagination: { page_index: pageIndex, page_size: pageSize, total_count: av.total_count, total_pages: av.total_pages },
+          items: lines,
+          total_quantity: totalQty,
+          totals,
+          shipping,
+          price_status: "cart-observed-not-guaranteed-payable: line and cart totals are upstream values, never recalculated or reconciled here",
           context: { store_code: sc.store_code, authenticated: true },
           observed_at: new Date().toISOString(),
         }) }],
