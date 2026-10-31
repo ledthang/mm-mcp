@@ -18,19 +18,21 @@ live behind `MM_LIVE_PARSE=1`, which the `npm test` script clears explicitly; th
 reported as `SKIP`, never as a pass, so the offline count never includes network cases.
 
 ```sh
-npm test            # offline: stdio 24 + catalog 40 + account 33 + gate harness 6 = 103 checks, 2 live-only SKIP
+npm test            # offline: auth setup 74 + existing 103 checks, 2 live-only SKIP
+npm run auth:setup  # operator login: bounded JSON stdin, real endpoint; see setup below
 npm start           # MCP stdio server (stdio in/out)
 npm run live:parse  # account suite with the 2 live gates enabled: 33 offline + 2 anonymous PARSE replays
 npm run live        # explicit live catalog gate: needs MM_STORE_CODE, real endpoint
 MM_STORE_CODE=b2c_10010_vi npm run live:account  # live account gate: real credential + real endpoint, 19 checks
 ```
 
-- `npm test` prints one summary per suite: `24/24`, `40/40`, `33/33 checks passed,
+- `npm test` expects `74/74` fake-only auth setup checks, then existing summaries:
+  `24/24`, `40/40`, `33/33 checks passed,
   2 live-only skipped (…)`, then `6/6 gate harness tests passed` (the
   `account-live.test.mjs` suite exercises the live-gate harness against **fake** children
   only — no real endpoint, no credential). The 2 skipped checks are labelled
-  `SKIP`, **not** counted as run, so the offline total is 103; the full total is 105 and
-  only `npm run live:parse` produces it (`35/35`).
+  `SKIP`, **not** counted as run; offline coverage totals 177 checks. The account
+  suite alone reaches `35/35` only with `npm run live:parse`.
 - `npm run live:parse` hits `https://online.mmvietnam.com/graphql` **anonymously** — no
   `Authorization` header, the auth file is never read. It only asserts the shipped query
   text PARSES (no `Syntax Error`); an `AUTHENTICATION`-shaped or HTTP 403 answer is
@@ -112,8 +114,8 @@ price_vnd, regular_price_vnd, promotion, member_offer }`.
 
 Auth comes from the **auth file** — `MM_AUTH_FILE` env, default
 `$XDG_DATA_HOME/mm-mcp/auth.json` (else `~/.local/share/mm-mcp/auth.json`). **There is
-no login tool**: setup means exporting an existing private browser session
-(`{ "authorization": "Bearer <token>", "store": "b2c_<digits>_vi" }`, chmod 600) to that
+no MCP login tool**: operator setup uses the separate `npm run auth:setup` CLI
+to save `{ "authorization": "Bearer <token>", "store": "b2c_<digits>_vi" }` (mode 600) to that
 path yourself. The file is a **secret, kept outside git** — the server reads it per
 call, validates it (regular file, not a symlink, owned by the running user, mode 600,
 parent dir with no group/other access, ≤ 16 KiB), and **never prints or logs the
@@ -155,48 +157,62 @@ cart answer is checked against the same two proofs as `mm_auth_status`: the repl
 a `Customer` and `store_code` really equals the store in the auth file
 (`STORE_MISMATCH`/`REQUIRES_LOGIN` otherwise).
 
-### Auth file: setup and expiry recovery (manual, no login tool)
+### Auth file: operator setup and manual re-login
 
-**Nothing here logs in.** The MCP server has no login tool and does no OAuth dance: the
-operator exports an existing private browser session into the auth file by hand, and the
-server only *proves* it live on every tool call.
+`npm run auth:setup` is a separate operator CLI, **not an MCP login tool**. It reads
+one JSON object from stdin with exactly `email`, `password`, and `store` string keys.
+No arguments are accepted. Passwords are never saved; stdout reports only `AUTH_SAVED`.
+Input and each response are limited to 16 KiB; stdin and each request have a 10-second
+deadline. Store must match `b2c_<1–8 digits>_vi`; control characters are rejected.
 
-Path: `MM_AUTH_FILE` if set, else `$XDG_DATA_HOME/mm-mcp/auth.json`, else
-`~/.local/share/mm-mcp/auth.json`. Contents (Linux):
+Use a trusted secret provider that emits JSON directly to stdin. For interactive
+setup, this optional Python stdlib wrapper collects hidden terminal prompts before
+starting the CLI, then sends escaped JSON directly to its stdin. No credential
+appears in argv, shell history, or stdout, and prompt time does not consume the
+CLI's stdin deadline:
 
 ```sh
-install -d -m 700 ~/.local/share/mm-mcp            # parent dir: 700, no group/other access
-umask 077
-${EDITOR:-vi} ~/.local/share/mm-mcp/auth.json      # write the two keys in the editor
-# { "authorization": "Bearer <token>", "store": "b2c_<digits>_vi" }
-chmod 600 ~/.local/share/mm-mcp/auth.json          # file: 600 exactly — 640/400/700 are rejected
+python3 - <<'PY'
+import getpass
+import json
+import subprocess
+
+credentials = {key: getpass.getpass(key + ": ") for key in ("email", "password", "store")}
+subprocess.run(["npm", "run", "--silent", "auth:setup"], input=json.dumps(credentials), text=True, check=True)
+PY
 ```
 
-Rules that matter (the server enforces the mode checks and fails closed on any violation):
+Do not paste passwords/tokens into chat, command arguments, or shell literals.
+Do not enable shell tracing or log secret-provider output. Python is only needed
+for this example; the CLI itself uses Node stdlib only.
 
-- Parent dir must be **700** (any group/other bit ⇒ `REQUIRES_LOGIN: auth dir allows
-  group/other access`); the file must be **600** and a **regular file** (a symlink at
-  either hop is refused, never followed); ≤ 16 KiB.
-- **Never pass the token in argv** (`echo "Bearer …" > auth.json` puts it in your shell
-  history and in `ps` output) and **never paste it into chat**. Open the file in an
-  editor, or `read -rs` from a terminal prompt.
-- Keep the file **outside git** (`.gitignore` covers `auth.json`, `session*.json`,
-  `cookies*.json`, `*token*`).
+The CLI sends requests only to `https://online.mmvietnam.com/graphql`, with the
+selected Store header and no cookies. First it reads `recaptchaV3Config` website key
+and forms. Enabled `CUSTOMER_LOGIN` stops with `CHALLENGE_REQUIRED`; unknown,
+malformed, or failed config stops with `CONFIG_UNVERIFIED`. Neither case attempts
+login or bypass. Otherwise it sends exactly one `SignIn` mutation, with no bearer
+header, then proves `customer.__typename === "Customer"` and the same
+`storeConfig.store_code` using the returned Bearer. No retry, browser, cart
+creation/merge, auth-session issuance, cookie storage, or refresh occurs.
 
-**Expiry / recovery.** Any credential problem surfaces as one actionable prefix,
-`REQUIRES_LOGIN:` — including HTTP 401/403 ("credential rejected"), an `AUTHENTICATION`
-GraphQL error, or a missing/too-open auth file. Recovery is manual and secure:
+Path precedence: `MM_AUTH_FILE`, then `$XDG_DATA_HOME/mm-mcp/auth.json`, then
+`~/.local/share/mm-mcp/auth.json`. The CLI creates missing directories privately,
+requires an owned mode-0700 immediate parent and owned mode-0600 regular existing
+target, and rejects symlinks at every ancestor and target. It writes only
+`{ "authorization": "Bearer <token>", "store": "b2c_<digits>_vi" }` through a synced
+mode-0600 temporary file and atomic rename. Unsafe existing permissions are rejected,
+not silently repaired. Failed login/proof/write leaves old auth untouched; errors
+contain fixed codes only, never upstream messages, paths, or secrets. Keep auth
+outside git. Use private directories under trusted filesystem ancestors; this is
+not a defense against another process running as your own OS user swapping paths.
 
-1. In the browser, use the private/incognito MM session that is still valid (or log in
-   there once by hand) and copy the bearer token out of it.
-2. Replace the file's `authorization` value in place (`chmod 600` again after editing),
-   keep `store` matching the store you actually use.
-3. Verify with `mm_auth_status` — it re-proves per call, so there is no cached success to
-   clear. The server itself needs no restart (it re-reads and re-proves on every call);
-   an MCP client that cached the earlier error just starts a new session.
-
-There is **no automatic refresh, no token store, no login tool** — that gap is open (see
-below), and a `REQUIRES_LOGIN` answer is the only signal.
+**Expiry recovery remains manual:** on `REQUIRES_LOGIN`, rerun this operator CLI,
+then verify with `mm_auth_status`. The server re-reads and re-proves each call;
+no restart is needed. If a challenge is required, use the supported first-party
+flow; this CLI does not solve challenges. **Automatic refresh is not implemented.**
+The [auth contract](docs/auth-lifecycle-contract.md) records the supplied primary
+observation and limits: CAPTCHA can change, MFA policy is not established, and no
+expiry-unit or automatic-renewal guarantee is claimed.
 
 ## Guarantees / out of contract
 
@@ -225,8 +241,8 @@ line or a selected address can never be changed through this server.
 
 The authenticated tools are read-only views for private use. `default_shipping` is never
 presented as the currently selected delivery address, and the cart's `shipping` block never
-claims selection was verified either. There is **no login tool** — the credential is an
-exported private browser session placed in the auth file by the operator.
+claims selection was verified either. There is **no MCP login tool** — the operator
+uses the separate setup CLI to place a proven credential in the auth file.
 
 **No UI parity claim**: `/checkout/cart/` was observed rendering a fallback/empty-looking
 view while the native `customerCart` query returns a real cart with lines. The cart tools
@@ -241,10 +257,14 @@ summary). Every call is a GET to one fixed origin; nothing in this server mutate
 upstream.
 
 **Verified and how:**
-- `npm test` (offline, deterministic): 103 checks — protocol framing 24, catalog mapping 40,
-  account/cart projection 33, live-gate harness 6 (fake children). Deterministic means no
+- `npm test` (offline, deterministic): 177 checks — auth setup 74, protocol framing 24,
+  catalog mapping 40, account/cart projection 33, live-gate harness 6 (fake children). Deterministic means no
   network, no credential, fixed fixtures, and the same counts on every run; CI runs this
-  on Node 22 and 24.
+  on Node 22 and 24. Primary host verification: **177/177 passed**, with two
+  live-only parse checks skipped. Restricted executor child-process failures
+  (`EPERM`) did not reproduce on the host. The setup CLI also completed one
+  authorized live login into a disposable private auth file; the existing account
+  module verified that credential and store before the file was removed.
 - `npm run live:parse`: 2 checks, anonymous HTTP, asserts only that both shipped query
   documents PARSE against the real endpoint. Last run: both PARSED (HTTP 403, 1
   authentication-shaped error each — expected for an anonymous call, not a syntax failure).
@@ -259,8 +279,8 @@ upstream.
 **Open gaps — no production-readiness claim:**
 - **No live authenticated cycle in CI.** Nothing proves a real logged-in cart read in an
   automated run; CI has no credential by design. Local operator runs only.
-- **No login / token-refresh tooling.** Setup and renewal are manual file exports; expiry
-  is detected per call as `REQUIRES_LOGIN` and must be fixed by hand.
+- **No automatic token refresh.** Separate operator CLI supports setup/manual re-login;
+  expiry is detected per call as `REQUIRES_LOGIN`. No cookies are persisted.
 - **No cart writes** (`add`/`update`/`remove`) and **no address-selection tool**, so no
   checkout path exists here at all.
 - **`mm_get_product` needs the exact `url_key`** (captured ProductPage contract: one
