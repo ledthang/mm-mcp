@@ -1,0 +1,14 @@
+{
+  "name": "mm-mcp",
+  "version": "0.1.0",
+  "description": "Minimal newline JSON-RPC 2.0 MCP stdio server for Mega Market (T1 core + T2 catalog search)",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node scripts/stdio.test.mjs && node scripts/catalog.test.mjs",
+    "live": "node scripts/catalog-live.mjs"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
