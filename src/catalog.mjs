@@ -337,10 +337,11 @@ export function createCatalog({ fetchImpl = globalThis.fetch, env = process.env 
       else throw new CatalogError("UNKNOWN_TOOL", String(name));
       return { content: [{ type: "text", text: JSON.stringify(projection) }] };
     } catch (e) {
-      const code = e instanceof CatalogError ? e.code : "INTERNAL";
-      const detail = e instanceof CatalogError ? e.detail : String(e && e.message || "").slice(0, 200);
-      if (!(e instanceof CatalogError)) process.stderr.write(`catalog internal: ${code} ${detail}\n`);
-      return { content: [{ type: "text", text: detail ? `${code}: ${detail}` : code }], isError: true };
+      // Fixed code only. A raw thrown message may hold upstream internals, bodies or
+      // credential-looking content: never echoed, never logged. Unknown throws are exactly
+      // "INTERNAL"; CatalogError details are hand-written, nonsecret and stay.
+      if (!(e instanceof CatalogError)) return { content: [{ type: "text", text: "INTERNAL" }], isError: true };
+      return { content: [{ type: "text", text: e.detail ? `${e.code}: ${e.detail}` : e.code }], isError: true };
     }
   }
 

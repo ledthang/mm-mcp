@@ -8,6 +8,9 @@
 // exact-match rules (not found / wrong url_key / multiple / SKU mismatch) fail closed.
 // Fixtures are real Response objects (undici) so res.body/cancel semantics are the real
 // ones, not hand-rolled mocks. No real network here; scripts/catalog-live.mjs is the gate.
+// Security section (failure redaction): every failure is one fixed code with nothing on
+// stderr; unknown throws are exactly INTERNAL. { raw: ... } stubs cover the spots a real
+// Response cannot fail at (a headers object that throws / has no get).
 import assert from "node:assert/strict";
 import { createCatalog, DETAIL_QUERY } from "../src/catalog.mjs";
 
@@ -83,7 +86,9 @@ const DETAIL = (items) => ({ data: { products: { items } } });
 
 // One fixture entry = one HTTP response to hand out (fresh per call, body never re-read).
 // spec: <payload object> (json, HTTP 200) | { status, <payload> } | { chunks: [Buffer],
-// contentLength? } (streamed body; highWaterMark 0 so pull == a real read).
+// contentLength? } (streamed body; highWaterMark 0 so pull == a real read) |
+// { throws: <value> } (fetch throws this value, Error or not) |
+// { raw: <object> } (prebuilt response-ish object, may be a stub: headers/body can throw).
 function mkFetch(specs, env = { MM_STORE_CODE: "b2c_10010_vi" }) {
   const calls = [];
   let n = 0;
@@ -93,6 +98,8 @@ function mkFetch(specs, env = { MM_STORE_CODE: "b2c_10010_vi" }) {
     calls.push(rec);
     n += 1;
     if (spec instanceof Error) throw spec;
+    if (spec.throws !== undefined) throw spec.throws; // any value, Error or not
+    if (spec.raw) return spec.raw; // hand-rolled response-like object: headers/body may throw
     const status = spec.status ?? 200;
     if (spec.chunks) {
       let i = 0;
@@ -101,6 +108,7 @@ function mkFetch(specs, env = { MM_STORE_CODE: "b2c_10010_vi" }) {
         pull(c) {
           rec.pulls += 1;
           if (i < spec.chunks.length) c.enqueue(spec.chunks[i++]);
+          else if (spec.streamError) c.error(new Error(spec.streamError)); // stream dies on the next read
           else c.close();
         },
         cancel() { rec.cancelled = true; },
@@ -120,6 +128,26 @@ function mkFetch(specs, env = { MM_STORE_CODE: "b2c_10010_vi" }) {
 const text = (env) => env.content[0].text;
 const payload = (env) => JSON.parse(text(env));
 const MB = 1024 * 1024;
+// FAKE secret canary, used only in injected failure text/streams to prove nothing raw leaks
+// to the caller and nothing is logged. Not a credential for anything.
+const CANARY = "sk_live_FAKE_9f3b7a2c4e6d";
+// One callTool round with process.stderr captured (the harness PASS/FAIL lines are written
+// outside this window, so anything collected here came from the request path).
+async function captureStderr(call) {
+  const real = process.stderr.write;
+  let err = "";
+  process.stderr.write = (chunk, enc, cb) => {
+    err += String(chunk);
+    const done = typeof enc === "function" ? enc : cb;
+    if (typeof done === "function") done.call(process.stderr);
+    return true;
+  };
+  try {
+    return { out: await call(), err };
+  } finally {
+    process.stderr.write = real;
+  }
+}
 
 async function main() {
   await t("search: exact request bytes (origin, variables, store, no cookies/auth)", async () => {
@@ -503,6 +531,60 @@ async function main() {
       assert.equal(calls.length, 1, "no retry storm for " + expect);
       if (spec.chunks || spec.status) assert.equal(calls[0].cancelled, true, "stream released: " + expect);
     }
+  });
+
+  // --- security contract: a failure is a fixed code and nothing else. Raw thrown text
+  // (transport internals, header errors, body noise) is never echoed to the caller and never
+  // written to stderr. CANARY is FAKE and injected by these fixtures only. ---
+  await t("failure redaction: fixed code only, stderr silent (unknown throws => INTERNAL)", async () => {
+    const stub = (over) => ({ ok: true, status: 200, headers: new Headers(), body: null, ...over });
+    const SEARCH = { query: "trứng" };
+    const DETAIL = { url_key: DETAIL_URL_KEY };
+    // [label, spec, method, args, fixed code expected, stream cancelled expected (null = n/a)]
+    const cases = [
+      // transport layer: mapped fixed codes
+      ["fetch throws transport error", new TypeError(`connect ECONNREFUSED 10.1.2.3:443 ${CANARY}`), "mm_search_products", SEARCH, "UPSTREAM_UNREACHABLE", null],
+      ["fetch throws timeout", Object.assign(new Error(`deadline ${CANARY} hit`), { name: "TimeoutError" }), "mm_search_products", SEARCH, "UPSTREAM_TIMEOUT", null],
+      ["fetch throws AbortError", Object.assign(new Error(`aborted ${CANARY}`), { name: "AbortError" }), "mm_get_product", DETAIL, "UPSTREAM_TIMEOUT", null],
+      ["fetch throws a bare string", { throws: `transport said ${CANARY}` }, "mm_search_products", SEARCH, "UPSTREAM_UNREACHABLE", null],
+      ["HTTP 500, canary body released unread", { status: 500, chunks: [Buffer.from(`upstream boom ${CANARY}`)] }, "mm_search_products", SEARCH, "UPSTREAM_HTTP_STATUS: HTTP 500", true],
+      ["declared content-length over cap, body never read", { chunks: [Buffer.alloc(3 * MB)], contentLength: 3 * MB }, "mm_get_product", DETAIL, "RESPONSE_TOO_LARGE", true],
+      ["body is not JSON", { json: `<html>${CANARY}</html>` }, "mm_search_products", SEARCH, "RESPONSE_NOT_JSON", null],
+      // header layer: no mapping covers a headers object that throws -> exactly INTERNAL
+      ["headers.get throws an Error", { raw: stub({ headers: { get() { throw new Error(`header cache ${CANARY} exploded`); } } }) }, "mm_search_products", SEARCH, "INTERNAL", null],
+      ["headers.get throws a bare string", { raw: stub({ headers: { get() { throw `header cache ${CANARY} exploded`; } } }) }, "mm_get_product", DETAIL, "INTERNAL", null],
+      ["headers has no get method", { raw: stub({ headers: {} }) }, "mm_search_products", SEARCH, "INTERNAL", null],
+      // body layer: a stream that dies on read is mapped; a non-byte chunk or a throwing
+      // byteLength escapes unmapped -> INTERNAL, and that un-read stream is never cancelled
+      ["body stream dies mid-read", { chunks: [Buffer.from('{"data":')], streamError: `mid-stream ${CANARY}` }, "mm_search_products", SEARCH, "UPSTREAM_UNREACHABLE", false],
+      ["body chunk is not bytes", { chunks: [42] }, "mm_search_products", SEARCH, "INTERNAL", false],
+      ["body chunk byteLength throws", { chunks: [{ get byteLength() { throw new Error(`chunk ${CANARY} unreadable`); } }] }, "mm_get_product", DETAIL, "INTERNAL", false],
+    ];
+    for (const [label, spec, method, args, expect, cancelled] of cases) {
+      const h = mkFetch([spec]);
+      const { out, err } = await captureStderr(() => h.cat.callTool(method, args));
+      assert.equal(out.isError, true, "must be an error envelope: " + label);
+      assert.equal(text(out), expect, "fixed code only: " + label + " got " + JSON.stringify(text(out)));
+      assert.ok(!text(out).includes(CANARY), "canary never echoed: " + label);
+      assert.equal(err, "", "nothing logged: " + label + " got " + JSON.stringify(err.slice(0, 160)));
+      assert.equal(h.calls.length, 1, "single attempt, no retry storm: " + label);
+      if (cancelled !== null) assert.equal(h.calls[0].cancelled, cancelled, "stream release: " + label);
+    }
+  });
+
+  await t("recovers after INTERNAL: next call still succeeds, stderr stays clean", async () => {
+    const h = mkFetch([
+      { raw: { ok: true, status: 200, headers: { get() { throw new Error(`header cache ${CANARY} exploded`); } }, body: null } },
+      ...OK_PAGE,
+    ]);
+    const first = await captureStderr(() => h.cat.callTool("mm_search_products", { query: "trứng" }));
+    assert.equal(text(first.out), "INTERNAL");
+    assert.equal(first.err, "", "INTERNAL is not logged");
+    const second = await captureStderr(() => h.cat.callTool("mm_search_products", { query: "trứng" }));
+    assert.equal(second.out.isError, undefined, "recovers: " + text(second.out));
+    assert.deepEqual(JSON.parse(text(second.out)).products.map((x) => x.sku), ["120167_21201677", "145667_21456671", "197560_21975608"]);
+    assert.equal(second.err, "", "success path logs nothing");
+    assert.equal(h.calls.length, 3, "failed call, then CARD + ENRICH");
   });
 
   await t("tools/call through server dispatch: envelope, unknown tool, notifications", async () => {
