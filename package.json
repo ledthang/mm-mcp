@@ -6,7 +6,7 @@
   "engines": { "node": ">=22" },
   "scripts": {
     "start": "node src/server.mjs",
-    "test": "node scripts/stdio.test.mjs && node scripts/catalog.test.mjs",
+    "test": "node scripts/stdio.test.mjs && node scripts/catalog.test.mjs && node scripts/account.test.mjs",
     "live": "node scripts/catalog-live.mjs"
   },
   "license": "UNLICENSED",

@@ -1,5 +1,6 @@
-// Minimal MCP stdio server: newline-delimited JSON-RPC 2.0 (T1 core + T2 catalog tool).
-// Stdlib only + native fetch via src/catalog.mjs.
+// Minimal MCP stdio server: newline-delimited JSON-RPC 2.0 (T1 core + T2 catalog tool
+// + T3 authenticated read tools).
+// Stdlib only + native fetch via src/catalog.mjs (guest) and src/account.mjs (auth).
 // Bytes split on byte 10, decoded to utf8 only once a line is complete (so a multibyte
 // char split across chunks survives). A line over MAX_LINE_BYTES is NEVER dispatched - its
 // kept head can still parse, and that is not validity. Oversized input is discarded until
@@ -7,9 +8,15 @@
 // written and awaited before the next bytes are read (backpressure, no promise queue).
 
 import { pathToFileURL } from "node:url";
-import { createCatalog, TOOLS } from "./catalog.mjs";
+import { createCatalog, TOOLS as CATALOG_TOOLS } from "./catalog.mjs";
+import { createAccount, TOOLS as ACCOUNT_TOOLS } from "./account.mjs";
 
-const catalog = createCatalog(); // native fetch, explicit MM_STORE_CODE read per call
+const catalog = createCatalog(); // guest view: native fetch, explicit MM_STORE_CODE per call
+const account = createAccount(); // auth read slice: auth file + live proof per call, no cache
+
+const TOOLS = [...CATALOG_TOOLS, ...ACCOUNT_TOOLS];
+const ACCOUNT_NAMES = new Set(ACCOUNT_TOOLS.map((t) => t.name));
+const implFor = (name) => (ACCOUNT_NAMES.has(name) ? account : catalog);
 
 const PROTOCOL_VERSION = "2024-11-05";
 const MAX_LINE_BYTES = 64 * 1024;
@@ -93,7 +100,7 @@ export async function dispatch(state, line) {
       if (!TOOLS.some((t) => t.name === params.name)) return err(id, INVALID_PARAMS, `unknown tool: ${params.name}`);
       const args = params.arguments ?? {};
       if (!isObj(args)) return err(id, INVALID_PARAMS, "arguments must be an object");
-      return ok(id, await catalog.callTool(params.name, args)); // upstream awaited; one reply per line
+      return ok(id, await implFor(params.name).callTool(params.name, args)); // upstream awaited; one reply per line
     }
     default:
       return err(id, METHOD_NOT_FOUND, `Unknown method: ${msg.method}`);

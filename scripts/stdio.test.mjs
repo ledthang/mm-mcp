@@ -191,12 +191,11 @@ async function main() {
     c.stop();
   });
 
-  await t("tools/list default params then cursor: single catalog tool, no cursor", async () => {
+  await t("tools/list default params then cursor: catalog+account tools, no cursor", async () => {
     const c = await live();
     const a = await c.call({ jsonrpc: "2.0", id: 16, method: "tools/list" });
-    assert.equal(a.result.tools.length, 1);
-    assert.equal(a.result.tools[0].name, "mm_search_products");
-    assert.equal(a.result.tools[0].inputSchema.additionalProperties, false);
+    assert.deepEqual(a.result.tools.map((t) => t.name), ["mm_search_products", "mm_auth_status", "mm_get_delivery_context", "mm_list_addresses"]);
+    assert.ok(a.result.tools.every((t) => t.inputSchema.additionalProperties === false));
     const b = await c.call({ jsonrpc: "2.0", id: 17, method: "tools/list", params: { cursor: "next" } });
     assert.deepEqual(b.result.tools, a.result.tools); // same single page for any cursor string
     const bad = await c.call({ jsonrpc: "2.0", id: 18, method: "tools/list", params: { cursor: 42 } });
