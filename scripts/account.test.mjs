@@ -6,13 +6,19 @@
 // REQUIRES_LOGIN with zero network; exact request bytes; live-per-call (no stale
 // success); proofs; store mismatch; projection + paging translation; HTTP/auth-category/
 // transport caps; injected-error redaction (raw throw => INTERNAL only); secret
-// redaction; ONE live public anonymous replay that checks the real GraphQL PARSE
-// response (anonymous, so no credential is involved; offline => explicit SKIP).
+// redaction; cart (T4a): exact cart request bytes (no variables, no cart id), line
+// projection + upstream totals, cart count/label shipping, real empty cart valid,
+// customerCart null => REQUIRES_LOGIN, bad rows/quantities/currencies fail closed, no
+// cart id argument accepted; TWO live public anonymous replays (account proof + cart)
+// that check the real GraphQL PARSE response (anonymous, so no credential is involved).
+// Those two are OPT-IN ONLY: they run when MM_LIVE_PARSE=1 (npm run live:parse).
+// Any other run records them as SKIP and makes NO request, so `npm test` is fully
+// offline/deterministic and a never-run network check is never counted as passed.
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createAccount, ACCOUNT_QUERY, TOOLS } from "../src/account.mjs";
+import { createAccount, ACCOUNT_QUERY, CART_QUERY, TOOLS } from "../src/account.mjs";
 
 const FAKE_AUTH = "Bearer eyFAKEtoken-not-real-9x";
 const STORE = "b2c_70010_vi";
@@ -89,6 +95,25 @@ const ADDR1 = { id: "a1", default_shipping: true, city: "Đà Lạt", street: "1
 const ADDR2 = { id: "a2", default_shipping: false, city: "HCMC", street: "9 Lê Lợi", custom_attributes: [] };
 const proof = (addresses, total = addresses.length, pages = 1, storeCode = STORE, storeName = "MM Mega Market") => ({
   data: { customer: { __typename: "Customer", addressesV2: { total_count: total, total_pages: pages, addresses } }, storeConfig: { store_code: storeCode, store_name: storeName } },
+});
+
+// ------------------------------------------- cart fixtures (T4a) — realistic, all fake data
+// Money is { value, currency } as upstream ships it; nothing here re-derives a total.
+const line = (uid, sku, name, quantity, price, row_total, currency = "VND") => ({
+  uid, quantity, product: { sku, name },
+  prices: { price: { value: price, currency }, row_total: { value: row_total, currency } },
+});
+const ship = (method_title = null, amount = null) => ({
+  selected_shipping_method: method_title === null ? null : { method_title, amount: { value: amount, currency: "VND" } },
+});
+// One document = one HTTP 200 answer for either cart tool (customer + storeConfig are
+// included because the cart projection requires both proofs).
+const cartDoc = ({ cart = "AUTO", items = [], total_quantity = items.length, grand_total = 0, subtotal_excluding_tax = 0, currency = "VND", shipping = [ship("Giao hoả tốc", 30000)], store_code = STORE, store_name = "MM Mega Market", customer = { __typename: "Customer" } } = {}) => ({
+  data: {
+    customerCart: cart === "AUTO" ? { total_quantity, items, prices: { grand_total: { value: grand_total, currency }, subtotal_excluding_tax: { value: subtotal_excluding_tax, currency } }, shipping_addresses: shipping } : cart,
+    customer,
+    storeConfig: { store_code, store_name },
+  },
 });
 
 async function main() {
@@ -197,8 +222,8 @@ async function main() {
     }
   });
 
-  await t("public parse regression: anonymous live replay answers WITHOUT a Syntax Error", async () => {
-    // The one live check in this suite, and it is ANONYMOUS: no Authorization header,
+  await t("public parse regression: anonymous live replay answers WITHOUT a Syntax Error", async (skip) => {
+    // OPT-IN live check (MM_LIVE_PARSE=1) and it is ANONYMOUS: no Authorization header,
     // no auth file touched. Upstream must PARSE (any AUTHENTICATION/other error shape
     // is fine; a GraphQL Syntax Error means the shipped query text is broken).
     const u = new URL("https://online.mmvietnam.com/graphql");
@@ -208,7 +233,7 @@ async function main() {
     try {
       res = await fetch(u.toString(), { headers: { store: STORE }, signal: AbortSignal.timeout(20000) });
     } catch (e) {
-      console.error(`SKIP live parse check (${(e && e.name) || "fetch failed"})`);
+      skip((e && e.name) || "fetch failed");
       return;
     }
     const body = await res.text();
@@ -217,7 +242,7 @@ async function main() {
     try { parsed = JSON.parse(body); } catch { parsed = null; }
     assert.ok(parsed !== null && isObj(parsed), "reply is still JSON even anonymous");
     console.error(`live parse ok: HTTP ${res.status}, errors=${Array.isArray(parsed.errors) ? parsed.errors.length : 0}`);
-  });
+  }, { live: true });
 
   await t("mm_auth_status: authenticated true + observed_at only after live proof; live per call", async () => {
     const { run, calls } = mk([proof([ADDR1])]);
@@ -301,7 +326,7 @@ async function main() {
   });
 
   await t("strict args: unknown props rejected on every tool, zero network", async () => {
-    for (const name of ["mm_auth_status", "mm_get_delivery_context", "mm_list_addresses"]) {
+    for (const name of ["mm_auth_status", "mm_get_delivery_context", "mm_list_addresses", "mm_get_cart", "mm_cart_summary"]) {
       const { run, calls } = mk([proof([ADDR1])]);
       const out = await run(name, { foo: 1 });
       assert.equal(out.isError, true, name + " must reject unknown prop");
@@ -386,22 +411,282 @@ async function main() {
     assert.ok(!text(await ok("mm_auth_status")).includes("eyFAKE"));
     assert.ok(!text(await ok("mm_get_delivery_context")).includes("Bearer"));
     assert.ok(!text(await ok("mm_list_addresses")).includes("eyFAKEtoken"));
+    const { run: cartOk } = mk([cartDoc({ items: [line("u1", "SKU-1", "Gạo ST25 5kg", 2, 165000, 330000)], total_quantity: 2, grand_total: 363000, subtotal_excluding_tax: 330000 })]);
+    assert.ok(!text(await cartOk("mm_get_cart")).includes("eyFAKE"));
+    assert.ok(!text(await cartOk("mm_cart_summary")).includes("Bearer"));
     const { run: denied } = mk([{ status: 401, json: {} }]);
     assert.ok(!text(await denied("mm_auth_status")).includes("Bearer"));
     assert.ok(!text(await denied("mm_list_addresses", { page_index: 1 })).includes(FAKE_AUTH));
+    assert.ok(!text(await denied("mm_get_cart")).includes(FAKE_AUTH), "cart error free of the token");
   });
 
-  console.error(`\n${checks - failures}/${checks} checks passed`);
-  process.exit(failures > 0 ? 1 : 0);
+  // ============================================================== cart read (T4a)
+  await t("cart request bytes: one GET, verbatim CART_QUERY, empty JSON vars, credential headers only", async () => {
+    const doc = cartDoc({ items: [line("u1", "SKU-1", "Gạo ST25 5kg", 1.5, 99000, 148500), line("u2", "SKU-2", "Nước mắm 500ml", 3, 45000, 135000)], total_quantity: 4.5, grand_total: 213500, subtotal_excluding_tax: 183500, shipping: [ship("Giao hoả tốc", 30000)] });
+    const { run, calls } = mk([doc, doc]);
+    const a = await run("mm_get_cart");
+    const b = await run("mm_cart_summary");
+    assert.equal(a.isError, undefined, "success: " + text(a));
+    assert.equal(b.isError, undefined, "success: " + text(b));
+    assert.equal(calls.length, 2, "one request per tool call, no retry");
+    for (const c of calls) {
+      const u = new URL(c.url);
+      assert.equal(u.origin, "https://online.mmvietnam.com");
+      assert.equal(u.pathname, "/graphql");
+      assert.equal(u.searchParams.get("query"), CART_QUERY, "query verbatim");
+      assert.equal(u.searchParams.get("variables"), "{}", "the owner lookup needs no variables");
+      assert.deepEqual(c.init.headers, { Authorization: FAKE_AUTH, store: STORE });
+      assert.ok(!Object.keys(c.init.headers).some((h) => /cookie/i.test(h)), "no cookies");
+      assert.equal(c.init.signal.constructor.name, "AbortSignal");
+      assert.ok(!("method" in c.init) || c.init.method === "GET", "GET");
+    }
+    let depth = 0, sibling = false, cartAt = 0;
+    for (let i = 0; i < CART_QUERY.length; i += 1) {
+      const ch = CART_QUERY[i];
+      if (ch === "{") depth += 1;
+      else if (ch === "}") depth -= 1;
+      if (depth < 0) { sibling = false; break; }
+      if (CART_QUERY.startsWith("storeConfig{", i) && depth === 1) sibling = true;
+      if (CART_QUERY.startsWith("customerCart{", i) && depth === 1) cartAt = 1;
+    }
+    assert.equal(depth, 0, "brace-balanced");
+    assert.ok(sibling && cartAt === 1, "customerCart / customer / storeConfig are top-level siblings");
+    assert.ok(!/\bid\s*:/.test(CART_QUERY) && !/customerCart\(id/.test(CART_QUERY), "no cart id argument anywhere");
+    assert.ok(!/street|city|postal|country/.test(CART_QUERY), "no address detail fetched: only method labels + count");
+    assert.ok(!/email|firstname|lastname|telephone/.test(CART_QUERY.toLowerCase()), "no identity fields");
+  });
+
+  await t("mm_get_cart: line projection, upstream totals, shipping count + labels, live per call", async () => {
+    const doc = cartDoc({
+      items: [line("u1", "8938505260015", "Gạo ST25 5kg", 1.5, 165000, 247500), line("u2", "8934567890123", "Nước mắm Phú Quốc 500ml", 2, 65000, 130000)],
+      total_quantity: 3.5, grand_total: 407500, subtotal_excluding_tax: 377500,
+      shipping: [ship("Giao hoả tốc", 30000), ship("Giao hàng tiêu chuẩn", 0)],
+    });
+    const { run, calls } = mk([doc]);
+    const p = payload(await run("mm_get_cart"));
+    assert.deepEqual(p.items, [
+      { uid: "u1", sku: "8938505260015", name: "Gạo ST25 5kg", quantity: 1.5, price_vnd: 165000, row_total_vnd: 247500 },
+      { uid: "u2", sku: "8934567890123", name: "Nước mắm Phú Quốc 500ml", quantity: 2, price_vnd: 65000, row_total_vnd: 130000 },
+    ], "exact line projection, upstream order, values untouched");
+    assert.deepEqual(p.totals, { subtotal_excluding_tax_vnd: 377500, grand_total_vnd: 407500, currency: "VND" }, "totals copied, never recomputed");
+    assert.equal(p.total_quantity, 3.5, "decimal total passthrough");
+    assert.deepEqual(p.shipping.address_count, 2, "address COUNT only");
+    assert.deepEqual(p.shipping.selected_methods, [{ method_title: "Giao hoả tốc", amount_vnd: 30000 }, { method_title: "Giao hàng tiêu chuẩn", amount_vnd: 0 }]);
+    assert.match(p.shipping.note, /NOT verified/);
+    assert.match(p.price_status, /^cart-observed-not-guaranteed-payable/);
+    assert.deepEqual(p.context, { store_code: STORE, authenticated: true });
+    assert.ok(!Number.isNaN(Date.parse(p.observed_at)));
+    const keys = new Set();
+    const collect = (v) => {
+      if (isObj(v)) for (const [k, x] of Object.entries(v)) { keys.add(k); collect(x); }
+      else if (Array.isArray(v)) for (const x of v) collect(x);
+    };
+    collect(p);
+    for (const banned of ["street", "city", "cart_id", "id", "email", "phone"]) {
+      assert.ok(!keys.has(banned), "no " + banned + " key anywhere in the cart payload");
+    }
+    const q = payload(await run("mm_get_cart"));
+    assert.notEqual(q.observed_at, undefined);
+    assert.equal(calls.length, 2, "live per call: no cached cart");
+  });
+
+  await t("mm_cart_summary: counts + totals only, no line rows, no cart id", async () => {
+    const { run } = mk([cartDoc({ items: [line("u1", "SKU-A", "A", 1, 10000, 10000), line("u2", "SKU-B", "B", 2, 20000, 40000)], total_quantity: 3, grand_total: 65000, subtotal_excluding_tax: 50000, shipping: [ship("Giao hoả tốc", 15000)] })]);
+    const p = payload(await run("mm_cart_summary"));
+    assert.deepEqual({ ...p, observed_at: "X" }, {
+      line_count: 2, total_quantity: 3, currency: "VND", subtotal_excluding_tax_vnd: 50000, grand_total_vnd: 65000,
+      shipping: { address_count: 1, selected_methods: [{ method_title: "Giao hoả tốc", amount_vnd: 15000 }], note: p.shipping.note },
+      price_status: p.price_status, context: { store_code: STORE, authenticated: true }, observed_at: "X",
+    });
+    assert.ok(!("items" in p), "summary carries no line rows");
+    assert.ok(!/cart_id/.test(JSON.stringify(p)), "no cart id exposed");
+    assert.match(p.price_status, /not recomputed from the lines/);
+  });
+
+  await t("empty actual cart: valid empty result (0 lines, count 0), not an error and not fabricated", async () => {
+    const { run, calls } = mk([cartDoc({ items: [], total_quantity: 0, grand_total: 0, subtotal_excluding_tax: 0, shipping: [] })]);
+    const p = payload(await run("mm_get_cart"));
+    assert.deepEqual(p.items, []);
+    assert.equal(p.total_quantity, 0);
+    assert.deepEqual(p.totals, { subtotal_excluding_tax_vnd: 0, grand_total_vnd: 0, currency: "VND" });
+    assert.deepEqual(p.shipping, { address_count: 0, selected_methods: [], note: p.shipping.note });
+    assert.equal(p.context.authenticated, true);
+    const s = payload(await run("mm_cart_summary"));
+    assert.equal(s.line_count, 0);
+    assert.equal(calls.length, 2);
+  });
+
+  await t("customerCart null: REQUIRES_LOGIN (no fabricated empty cart); malformed shapes: BAD_UPSTREAM_DATA", async () => {
+    const { run, calls } = mk([cartDoc({ cart: null })]);
+    const out = await run("mm_get_cart");
+    assert.equal(out.isError, true);
+    assert.match(text(out), /^REQUIRES_LOGIN: HTTP 200 but no customerCart: not authenticated$/);
+    assert.equal(calls.length, 1);
+    const s = await (mk([cartDoc({ cart: null })]).run("mm_cart_summary"));
+    assert.match(text(s), /^REQUIRES_LOGIN: HTTP 200 but no customerCart/);
+    for (const cart of ["nope", 42, {}, { items: [] }, { total_quantity: 0, items: "nope", prices: {}, shipping_addresses: [] }, { total_quantity: null, items: [], prices: {}, shipping_addresses: [] }, { total_quantity: -1, items: [], prices: {}, shipping_addresses: [] }]) {
+      const o = await (mk([cartDoc({ cart })]).run("mm_get_cart"));
+      assert.equal(o.isError, true, "must fail closed: " + JSON.stringify(cart));
+      assert.match(text(o), /^BAD_UPSTREAM_DATA: (customerCart|items|total_quantity)$/, "wrong code for " + JSON.stringify(cart));
+    }
+  });
+
+  await t("cart rows fail closed: bad shape, duplicate uid, bad quantity (0/negative/string/null/bool)", async () => {
+    const bad = [
+      [line("u1", "S", "N", 0, 1000, 1000), /cart line quantity/],
+      [line("u1", "S", "N", -2, 1000, 1000), /cart line quantity/],
+      [line("u1", "S", "N", "2", 1000, 1000), /cart line quantity/],
+      [line("u1", "S", "N", null, 1000, 1000), /cart line quantity/],
+      [line("u1", "S", "N", true, 1000, 1000), /cart line quantity/],
+      [{ uid: "u1", quantity: 1, product: { sku: "S" }, prices: {} }, /cart line$/],
+      [line("u1", "", "N", 1, 1000, 1000), /cart line$/],
+      ["just a string", /cart line$/],
+      [null, /cart line$/],
+    ];
+    for (const [row, re] of bad) {
+      const { run, calls } = mk([cartDoc({ items: [line("u1", "OK-1", "OK", 1, 1000, 1000), row], total_quantity: 5 })]);
+      const out = await run("mm_get_cart");
+      assert.equal(out.isError, true, "must fail closed: " + JSON.stringify(row));
+      assert.match(text(out), re, "wrong code for " + JSON.stringify(row));
+      assert.ok(!text(out).includes("OK-1"), "no partial truth emitted");
+      assert.equal(calls.length, 1);
+    }
+    const dup = await (mk([cartDoc({ items: [line("u1", "A", "n", 1, 1000, 1000), line("u1", "B", "m", 1, 1000, 1000)] })]).run("mm_cart_summary"));
+    assert.match(text(dup), /^BAD_UPSTREAM_DATA: duplicate cart line uid$/);
+  });
+
+  await t("money guard: non-VND, missing/negative/string/NaN-shaped currency or value => BAD_MONEY", async () => {
+    const cases = [
+      [line("u1", "S", "N", 1, 1000, 1000, "USD"), /BAD_MONEY: cart line (price|row_total)/],
+      [line("u1", "S", "N", 1, 1000, 1000, "vnd"), /BAD_MONEY: cart line price/],
+      [line("u1", "S", "N", 1, -500, 1000), /BAD_MONEY: cart line price/],
+      [line("u1", "S", "N", 1, "1000", 1000), /BAD_MONEY: cart line price/],
+      [line("u1", "S", "N", 1, null, 1000), /BAD_MONEY: cart line price/],
+    ];
+    for (const [row, re] of cases) {
+      const { run, calls } = mk([cartDoc({ items: [row] })]);
+      const out = await run("mm_get_cart");
+      assert.match(text(out), re, "wrong code for " + JSON.stringify(row));
+      assert.ok(!/\d{3,}/.test(text(out).replace(/BAD_MONEY: [a-z_ ]+/, "")), "amounts never echoed: " + text(out));
+      assert.ok(!text(out).includes("USD") && !text(out).includes("vnd"), "currency label not echoed either");
+      assert.equal(calls.length, 1);
+    }
+    // cart totals: grand_total / subtotal malformed (NaN arrives as null through JSON)
+    const badTotals = [
+      [{ grand_total: { value: 5000, currency: "USD" }, subtotal_excluding_tax: { value: 5000, currency: "VND" } }, /BAD_MONEY: cart grand_total/],
+      [{ grand_total: { value: "NaN", currency: "VND" }, subtotal_excluding_tax: { value: 5000, currency: "VND" } }, /BAD_MONEY: cart grand_total/],
+      [{ grand_total: { value: null, currency: "VND" }, subtotal_excluding_tax: { value: 5000, currency: "VND" } }, /BAD_MONEY: cart grand_total/],
+      [{ grand_total: { value: 5000, currency: "VND" } }, /BAD_MONEY: cart subtotal_excluding_tax/],
+    ];
+    for (const [prices, re] of badTotals) {
+      const doc = cartDoc({ items: [] });
+      doc.data.customerCart.prices = prices;
+      const out = await (mk([doc]).run("mm_cart_summary"));
+      assert.match(text(out), re, "wrong code for " + JSON.stringify(prices));
+    }
+    // shipping method amount malformed
+    const shipBad = cartDoc({ items: [], shipping: [ship("Giao hoả tốc", -1)] });
+    assert.match(text(await (mk([shipBad]).run("mm_get_cart"))), /^BAD_MONEY: shipping method amount$/);
+    const shipNoTitle = { data: { customerCart: { total_quantity: 0, items: [], prices: { grand_total: { value: 0, currency: "VND" }, subtotal_excluding_tax: { value: 0, currency: "VND" } }, shipping_addresses: [{ selected_shipping_method: { amount: { value: 0, currency: "VND" } } }] }, customer: { __typename: "Customer" }, storeConfig: { store_code: STORE, store_name: "MM Mega Market" } } };
+    assert.match(text(await (mk([shipNoTitle]).run("mm_get_cart"))), /^BAD_UPSTREAM_DATA: selected_shipping_method$/);
+    const shipMissing = JSON.parse(JSON.stringify(shipNoTitle));
+    delete shipMissing.data.customerCart.shipping_addresses[0].selected_shipping_method;
+    assert.match(text(await (mk([shipMissing]).run("mm_get_cart"))), /^BAD_UPSTREAM_DATA: shipping address row$/);
+    // an address with nothing selected is reported as a count, with no invented label
+    const quiet = cartDoc({ items: [], shipping: [ship(null), ship("Giao hàng tiêu chuẩn", 0)] });
+    const p = payload(await (mk([quiet]).run("mm_get_cart")));
+    assert.deepEqual(p.shipping.selected_methods, [{ method_title: "Giao hàng tiêu chuẩn", amount_vnd: 0 }]);
+    assert.equal(p.shipping.address_count, 2);
+  });
+
+  await t("cart tools accept NO cart id: cart_id / id / uid / line_id rejected with zero network", async () => {
+    for (const name of ["mm_get_cart", "mm_cart_summary"]) {
+      for (const arg of [{ cart_id: "cart-123" }, { id: 1 }, { uid: "u1" }, { cart_uid: "u1" }, { line_id: "l1" }, { cart: {} }]) {
+        const { run, calls } = mk([cartDoc({})]);
+        const out = await run(name, arg);
+        assert.equal(out.isError, true, name + " must reject " + JSON.stringify(arg));
+        assert.match(text(out), /^INVALID_ARGS: unknown argument\(s\): /);
+        assert.equal(calls.length, 0, "arg rejection makes no request: " + name);
+      }
+    }
+  });
+
+  await t("cart proofs: store mismatch and wrong __typename fail closed; auth-category stays REQUIRES_LOGIN", async () => {
+    const doc = cartDoc({ items: [line("u1", "S", "N", 1, 1000, 1000)], store_code: "b2c_99999_vi" });
+    const out = await (mk([doc]).run("mm_get_cart"));
+    assert.match(text(out), /^STORE_MISMATCH: storeConfig disagrees with the requested store$/);
+    assert.ok(!text(out).includes("b2c_99999_vi"), "mismatched code not echoed");
+    const typeName = cartDoc({ items: [line("u1", "S", "N", 1, 1000, 1000)], customer: { __typename: "GuestCart" } });
+    assert.match(text(await (mk([typeName]).run("mm_cart_summary"))), /^BAD_UPSTREAM_DATA: customer\.__typename$/);
+    const noCust = cartDoc({ items: [line("u1", "S", "N", 1, 1000, 1000)], customer: null });
+    assert.match(text(await (mk([noCust]).run("mm_get_cart"))), /^REQUIRES_LOGIN: HTTP 200 but no customer: not authenticated$/);
+    const authErr = { errors: [{ message: "The customer isn't authorized.", categories: ["AUTHENTICATION"] }] };
+    const out2 = await (mk([authErr]).run("mm_get_cart"));
+    assert.match(text(out2), /^REQUIRES_LOGIN: 1 authentication error\(s\)$/);
+    assert.ok(!text(out2).includes("isn't authorized"), "upstream message never echoed");
+    const to = Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
+    assert.equal(text(await (mk([to]).run("mm_cart_summary"))), "UPSTREAM_TIMEOUT");
+  });
+
+  await t("live parse regression: CART_QUERY answered anonymously without a Syntax Error", async (skip) => {
+    // OPT-IN live check (MM_LIVE_PARSE=1), ANONYMOUS: no Authorization header, the auth
+    // file is never read by this check.
+    const u = new URL("https://online.mmvietnam.com/graphql");
+    u.searchParams.set("query", CART_QUERY);
+    u.searchParams.set("variables", "{}");
+    let res;
+    try {
+      res = await fetch(u.toString(), { headers: { store: STORE }, signal: AbortSignal.timeout(20000) });
+    } catch (e) {
+      skip((e && e.name) || "fetch failed");
+      return;
+    }
+    const body = await res.text();
+    assert.ok(!/Syntax error/i.test(body), "upstream PARSE failed: " + body.slice(0, 200));
+    let parsed;
+    try { parsed = JSON.parse(body); } catch { parsed = null; }
+    assert.ok(isObj(parsed), "reply is still JSON even anonymous");
+    console.error(`cart live parse ok: HTTP ${res.status}, errors=${Array.isArray(parsed.errors) ? parsed.errors.length : 0}`);
+  }, { live: true });
+
+  const summary = [`${checks - failures}/${checks} checks passed`];
+  if (skippedOffline) summary.push(`${skippedOffline} live-only skipped (no request made — npm run live:parse)`);
+  if (liveUnverified) summary.push(`${liveUnverified} live checks NOT verified (attempt failed) — fix connectivity, rerun npm run live:parse`);
+  console.error("\n" + summary.join(", "));
+  process.exit(failures > 0 || liveUnverified > 0 ? 1 : 0);
 }
 
+// Opt-in live gate: nothing in this suite touches the network unless MM_LIVE_PARSE=1
+// (npm run live:parse). The npm test script clears MM_LIVE_PARSE, so it is offline by
+// construction even if the caller exported it.
+// t(name, fn)              => offline check, always runs and is counted.
+// t(name, fn, {live: true})=> live check: SKIP (not counted, no request made) unless
+//                            opted in; if opted in but unreachable it is SKIP with the
+//                            failure reason and the run exits 1 (gate NOT verified).
+const LIVE_PARSE = process.env.MM_LIVE_PARSE === "1";
 let checks = 0;
 let failures = 0;
-async function t(name, fn) {
+let skippedOffline = 0; // live check not requested => no request made
+let liveUnverified = 0; // live check requested, request failed => honest SKIP, exit 1
+
+async function t(name, fn, { live = false } = {}) {
+  if (live && !LIVE_PARSE) {
+    skippedOffline += 1;
+    console.error("SKIP " + name + " (live-only, no request made — npm run live:parse)");
+    return;
+  }
   checks += 1;
+  let why = null;
+  const skip = (reason) => { why = String(reason); };
   try {
-    await fn();
-    console.error("PASS " + name);
+    await fn(skip);
+    if (why) {
+      checks -= 1;
+      liveUnverified += 1;
+      console.error("SKIP " + name + " (live attempt failed: " + why + ")");
+    } else {
+      console.error("PASS " + name);
+    }
   } catch (e) {
     failures += 1;
     console.error("FAIL " + name + " :: " + (e && e.message));

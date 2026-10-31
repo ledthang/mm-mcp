@@ -1,0 +1,34 @@
+name: test
+
+# Stdlib-only project: no `npm install`/`npm ci` step on purpose. `npm test` is fully
+# offline (live endpoint checks are opt-in via MM_LIVE_PARSE=1, see README), so CI needs
+# no network beyond fetching the runner images and the Node distribution.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22", "24"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Syntax check src modules (node --check)
+        run: |
+          set -e
+          for f in src/*.mjs; do
+            node --check "$f"
+          done
+
+      - name: Offline test suite (live endpoint checks excluded)
+        run: npm test
