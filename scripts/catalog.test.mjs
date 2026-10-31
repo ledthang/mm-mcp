@@ -30,8 +30,8 @@ async function t(name, fn) {
 // --- fixtures from the captured contract (public guest data, store b2c_10010_vi) ---
 const CARD = (items, total = 32, pages = 2) => ({ data: { products: { items, total_count: total, page_info: { total_pages: pages } } } });
 const ENR = (items) => ({ data: { products: { items } } });
-const cardItem = (id, sku, name, unit, step = 1, stock = "IN_STOCK") => ({
-  id, sku, name, unit_ecom: unit, mm_qty_step: step, stock_status: stock,
+const cardItem = (id, sku, name, unit, step = 1, stock = "IN_STOCK", url_key = "") => ({
+  id, sku, name, unit_ecom: unit, mm_qty_step: step, stock_status: stock, url_key,
 });
 const enrichItem = (sku, final, regular, promoName = null, mcard = null) => ({
   sku,
@@ -47,11 +47,11 @@ const enrichItem = (sku, final, regular, promoName = null, mcard = null) => ({
     },
   },
 });
-const A = { card: cardItem(69667, "120167_21201677", "Trứng gà tươi CP, hộp 10 quả, 61-67g", "Hộp"),
+const A = { card: cardItem(69667, "120167_21201677", "Trứng gà tươi CP, hộp 10 quả, 61-67g", "Hộp", 1, "IN_STOCK", "trung-ga-tuoi-cp-hop-10-qua-120167"),
             enrich: enrichItem("120167_21201677", 31000, 31000, "Mua từ 3 giảm 4.84%") };
-const B = { card: cardItem(69669, "145667_21456671", "Trứng gà tươi CP, khay 30 quả, 54-60g", "Khay"),
+const B = { card: cardItem(69669, "145667_21456671", "Trứng gà tươi CP, khay 30 quả, 54-60g", "Khay", 1, "IN_STOCK", "trung-ga-tuoi-cp-khay-30-qua-54-60g"),
             enrich: enrichItem("145667_21456671", 89000, 89000) };
-const C = { card: cardItem(69678, "197560_21975608", "Trứng gà ta Vĩnh Thành Đạt, hộp 10 quả, 60g", "Hộp"),
+const C = { card: cardItem(69678, "197560_21975608", "Trứng gà ta Vĩnh Thành Đạt, hộp 10 quả, 60g", "Hộp", 1, "IN_STOCK", "trung-ga-ta-vinh-thanh-dat-hop-10-qua-60g"),
             enrich: enrichItem("197560_21975608", 42400, 42400) };
 const OK_PAGE = [CARD([A.card, B.card, C.card]), ENR([A.enrich, B.enrich, C.enrich])];
 
@@ -126,6 +126,37 @@ function mkFetch(specs, env = { MM_STORE_CODE: "b2c_10010_vi" }) {
   };
 }
 const text = (env) => env.content[0].text;
+// GraphQL selection check (brace-counted, exact): true only if `field` is selected inside
+// the first `outer` selection set of `path` ("" = whole document). A plain .includes()
+// on the query string proves nothing — nested copies are not the item being shown.
+function selectsIn(query, path, field) {
+  let scope = query;
+  for (const owner of path) {
+    const next = selectIn(scope, owner);
+    if (next === "") return false;
+    scope = next;
+  }
+  let depth = 0;
+  for (const token of scope.match(/[_A-Za-z][_0-9A-Za-z]*|[{}]/g) ?? []) {
+    if (token === "{") depth++;
+    else if (token === "}") depth--;
+    else if (depth === 1 && token === field) return true;
+  }
+  return false;
+}
+function selectIn(scope, owner) {
+  const at = scope.indexOf(owner + "{");
+  if (at === -1) return "";
+  let open = 1;
+
+  let k = at + owner.length + 1;
+  for (; open > 0 && k < scope.length; k++) {
+    if (scope[k] === "{") open++;
+    else if (scope[k] === "}") open--;
+  }
+  return open === 0 ? scope.slice(at, k) : "";
+}
+
 const payload = (env) => JSON.parse(text(env));
 const MB = 1024 * 1024;
 // FAKE secret canary, used only in injected failure text/streams to prove nothing raw leaks
@@ -180,6 +211,7 @@ async function main() {
     assert.deepEqual(p.products.map((x) => x.sku), ["120167_21201677", "145667_21456671", "197560_21975608"], "CARD order preserved");
     assert.deepEqual({ ...p.products[0] }, {
       id: 69667, sku: "120167_21201677", name: "Trứng gà tươi CP, hộp 10 quả, 61-67g", unit: "Hộp",
+      url_key: "trung-ga-tuoi-cp-hop-10-qua-120167",
       quantity_step: 1, stock_status: "IN_STOCK", price_vnd: 31000, regular_price_vnd: 31000,
       promotion: "Mua từ 3 giảm 4.84%", member_offer: null,
     });
@@ -375,6 +407,22 @@ async function main() {
     assert.equal(u.searchParams.get("query"), DETAIL_QUERY, "captured query, verbatim");
     assert.ok(u.searchParams.get("query").includes("url_key:{eq:$urlKey}") && u.searchParams.get("query").includes("show_disabled:true"), "exact url_key filter + show_disabled");
     assert.ok(!u.searchParams.get("query").includes(DETAIL_URL_KEY), "argument never interpolated into the query");
+    const q = u.searchParams.get("query");
+    const answerPath = ["fragment ProductDetailsFragment on ProductInterface", "price_range", "maximum_price"];
+    const answerFragment = selectIn(q, answerPath[0]);
+    const answerMax = selectIn(selectIn(answerFragment, "price_range"), "maximum_price");
+    assert.notEqual(answerMax, "", "answer price_range.maximum_price block exists");
+    assert.ok(selectsIn(q, answerPath, "regular_price"),
+      "answer price_range.maximum_price selects regular_price directly");
+    const strippedFragment = answerFragment.replace(answerMax,
+      answerMax.replace(selectIn(answerMax, "regular_price"), ""));
+    const stripped = q.replace(answerFragment, strippedFragment);
+    assert.ok(stripped !== q, "negative control document built");
+    assert.ok(!selectsIn(stripped, answerPath, "regular_price"),
+      "negative control: answer block lost regular_price");
+    assert.ok(stripped.indexOf("regular_price{", stripped.indexOf("similar_products{")) !== -1,
+      "negative control: nested similar_products copy still selects regular_price, so only the answer block changed");
+    assert.ok(q.includes("render_stage:CARD") === false, "detail document is not the search document");
     assert.deepEqual(JSON.parse(u.searchParams.get("variables")), { urlKey: DETAIL_URL_KEY }, "one JSON variable, serialized");
     assert.deepEqual(Object.keys(calls[0].init.headers), ["store"], "only the store header");
     assert.equal(calls[0].init.headers.store, "b2c_10010_vi");
@@ -432,6 +480,77 @@ async function main() {
     const out = await runDetail({ url_key: DETAIL_URL_KEY });
     assert.equal(text(out), "PRODUCT_NOT_FOUND: returned url_key is not the requested one");
     assert.equal(calls.length, 1);
+  });
+
+  // Grouped: CARD url_key validation. A card slug must be a usable same-store slug or the
+  // whole search fails closed BEFORE the ENRICH stage (an unvalidated slug would hand the
+  // caller a detail link that cannot resolve, and ENRICH prices for a row we reject anyway).
+  await t("search url_key validation: missing/empty/malformed slug fail closed before ENRICH; valid slug projected unchanged", async () => {
+    // missing / empty / malformed path slugs: no row without a valid slug is emitted.
+    for (const bad of [undefined, "", "../x"]) {
+      const card = { ...C.card };
+      if (bad === undefined) delete card.url_key; else card.url_key = bad;
+      const { run, calls } = mkFetch([CARD([card, A.card, B.card]), ENR([C.enrich, A.enrich, B.enrich])]);
+      const out = await run();
+      assert.equal(out.isError, true, "must fail closed: " + JSON.stringify(bad));
+      assert.match(text(out), /^BAD_UPSTREAM_DATA: card item url_key$/);
+      assert.equal(calls.length, 1, "ENRICH never called for " + JSON.stringify(bad));
+    }
+    // valid slug: projected byte-for-byte unchanged (never rewritten, lowercased or invented)
+    const { run, calls } = mkFetch(OK_PAGE);
+    const p = payload(await run());
+    assert.deepEqual(p.products.map((x) => x.url_key), [
+      "trung-ga-tuoi-cp-hop-10-qua-120167", "trung-ga-tuoi-cp-khay-30-qua-54-60g",
+      "trung-ga-ta-vinh-thanh-dat-hop-10-qua-60g",
+    ], "slugs passed through unchanged");
+    assert.equal(calls.length, 2, "valid rows do reach ENRICH");
+  });
+
+  // Alias hop: search hands out an alias slug, detail serves a canonical slug for the
+  // same SKU. Accepted ONLY with a matching expected_sku; never an invented slug.
+  await t("detail: alias slug accepted with matching expected_sku, canonical slug projected", async () => {
+    const ALIAS = "trung-ga-tuoi-cp-hop-10-qua";
+    const CANON = "trung-ga-cp-hop-10-s-21201677-120167";
+    const { runDetail, calls } = mkFetch([DETAIL([detailItem({ url_key: CANON })])]);
+    const p = JSON.parse(text(await runDetail({ url_key: ALIAS, expected_sku: "120167_21201677" })));
+    assert.equal(p.product.url_key, CANON, "upstream canonical slug returned, never the requested alias");
+    assert.equal(p.product.sku, "120167_21201677");
+    assert.deepEqual(p.context, { store_code: "b2c_10010_vi", authenticated: false }, "same store, guest");
+    assert.equal(calls.length, 1, "one request, no fallback lookup");
+    assert.deepEqual(Object.keys(p.product).sort(), ["id", "member_offer", "name", "price_vnd", "promotion", "quantity_step", "regular_price_vnd", "sku", "stock_status", "unit", "url_key"], "exact projection keys, no new flag");
+  });
+
+  // Without expected_sku the caller has no identity proof: strict slug equality stays.
+  await t("detail: slug mismatch without expected_sku -> PRODUCT_NOT_FOUND, no guessing", async () => {
+    const CANON = "trung-ga-cp-hop-10-s-21201677-120167";
+    const { runDetail, calls } = mkFetch([DETAIL([detailItem({ url_key: CANON })])]);
+    const out = await runDetail({ url_key: "trung-ga-tuoi-cp-hop-10-qua" });
+    assert.equal(out.isError, true);
+    assert.equal(text(out), "PRODUCT_NOT_FOUND: returned url_key is not the requested one");
+    assert.equal(calls.length, 1, "no retry, no second lookup by sku");
+  });
+
+  // expected_sku binds identity only when it matches; slug equality does not excuse it.
+  await t("detail: wrong expected_sku -> SKU_MISMATCH even when slug matches", async () => {
+    const { runDetail, calls } = mkFetch([DETAIL([detailItem()])]);
+    const out = await runDetail({ url_key: DETAIL_URL_KEY, expected_sku: "99999_99999" });
+    assert.equal(out.isError, true);
+    assert.match(text(out), /^SKU_MISMATCH: 120167_21201677 != 99999_99999$/);
+    assert.equal(calls.length, 1, "no retry");
+  });
+
+  // The slug that comes back must be usable in this store, in every accepted branch.
+  await t("detail: malformed canonical slug rejected, also under matching expected_sku", async () => {
+    // malformed slug answer + matching expected_sku: still refused, the hop is not opened
+    const bad = mkFetch([DETAIL([detailItem({ url_key: "trung ga cp hop" })])]);
+    const out = await bad.runDetail({ url_key: "trung-ga-tuoi-cp-hop-10-qua", expected_sku: "120167_21201677" });
+    assert.equal(out.isError, true);
+    assert.equal(text(out), "BAD_UPSTREAM_DATA: product url_key");
+    assert.equal(bad.calls.length, 1, "no retry");
+    // malformed slug answer without expected_sku: the strict path names the same failure
+    const strict = mkFetch([DETAIL([detailItem({ url_key: "trung/ga/cp" })])]);
+    assert.equal(text(await strict.runDetail({ url_key: DETAIL_URL_KEY })),
+      "PRODUCT_NOT_FOUND: returned url_key is not the requested one");
   });
 
   await t("detail: several items for one exact filter -> MULTIPLE_PRODUCTS fail closed", async () => {

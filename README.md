@@ -18,18 +18,18 @@ live behind `MM_LIVE_PARSE=1`, which the `npm test` script clears explicitly; th
 reported as `SKIP`, never as a pass, so the offline count never includes network cases.
 
 ```sh
-npm test            # offline: stdio 24 + catalog 22 + account 33 + gate harness 5 = 84 checks, 2 live-only SKIP
+npm test            # offline: stdio 24 + catalog 40 + account 33 + gate harness 6 = 103 checks, 2 live-only SKIP
 npm start           # MCP stdio server (stdio in/out)
 npm run live:parse  # account suite with the 2 live gates enabled: 33 offline + 2 anonymous PARSE replays
 npm run live        # explicit live catalog gate: needs MM_STORE_CODE, real endpoint
 MM_STORE_CODE=b2c_10010_vi npm run live:account  # live account gate: real credential + real endpoint, 19 checks
 ```
 
-- `npm test` prints one summary per suite: `24/24`, `22/22`, `33/33 checks passed,
-  2 live-only skipped (…)`, then `5/5 gate harness tests passed` (the
+- `npm test` prints one summary per suite: `24/24`, `40/40`, `33/33 checks passed,
+  2 live-only skipped (…)`, then `6/6 gate harness tests passed` (the
   `account-live.test.mjs` suite exercises the live-gate harness against **fake** children
   only — no real endpoint, no credential). The 2 skipped checks are labelled
-  `SKIP`, **not** counted as run, so the offline total is 84; the full total is 86 and
+  `SKIP`, **not** counted as run, so the offline total is 103; the full total is 105 and
   only `npm run live:parse` produces it (`35/35`).
 - `npm run live:parse` hits `https://online.mmvietnam.com/graphql` **anonymously** — no
   `Authorization` header, the auth file is never read. It only asserts the shipped query
@@ -77,11 +77,14 @@ leak into catalog results.
   - `page_size`: one of 10, 20, 24, 50 (default 24).
 
 Returns a projection per page: `{ products, pagination, context, price_status,
-observed_at }`. Each product row: `{ id, sku, name, unit, quantity_step, stock_status,
+observed_at }`. Each product row: `{ id, sku, url_key, name, unit, quantity_step, stock_status,
 price_vnd, regular_price_vnd, promotion, member_offer }`.
 
 - `mm_get_product(url_key, expected_sku?)` — **exact guest URL-key lookup**, not search.
-  Runs the captured ProductPage query: `products(filter:{url_key:{eq:<url_key>}},
+  Runs a query derived from the ProductPage capture, with an explicit top-level
+  `price_range.maximum_price.regular_price` selection added. The projected regular price
+  still comes from `price.regularPrice.amount`:
+  `products(filter:{url_key:{eq:<url_key>}},
   show_disabled:true)` — one exact `url_key` (slug: `[A-Za-z0-9._-]`, no slash, query
   or fragment chars) in, **exactly one** product out, or a fixed failure
   (`PRODUCT_NOT_FOUND` / `SKU_MISMATCH` / `INVALID_ARGS` …). `expected_sku`, if given,
@@ -89,6 +92,14 @@ price_vnd, regular_price_vnd, promotion, member_offer }`.
   - Example: `mm_get_product(url_key="trung-ga-tuoi-cp-hop-10-qua-120167")` →
     the exact egg product (`sku 120167_21201677`); with
     `expected_sku="99999_99999"` it fails `SKU_MISMATCH`, never shows a wrong product.
+  - **Same-store search → detail**: take `url_key` **and** `sku` from one
+    `mm_search_products` row (same store, that page) and call
+    `mm_get_product(url_key=<row.url_key>, expected_sku=<row.sku>)` in that same store. Upstream may serve the
+    product under a different canonical slug than the card showed, so `expected_sku`
+    is what binds identity — the call succeeds if the single answer's SKU matches,
+    even under another slug. Returned detail `product.url_key` is the upstream
+    canonical slug, not necessarily the search alias. Without `expected_sku` the returned `url_key` must equal
+    the requested one exactly (strict: no guessing, `PRODUCT_NOT_FOUND` otherwise).
   - **No SKU-only lookup**: this tool asks by `url_key`, not by SKU — an SKU alone is
     not a valid argument (`INVALID_ARGS`), and search-by-sku would be search-as-detail,
     which the captured contract rules out (the CARD `sku:{eq}` filter is ignored
@@ -230,8 +241,8 @@ summary). Every call is a GET to one fixed origin; nothing in this server mutate
 upstream.
 
 **Verified and how:**
-- `npm test` (offline, deterministic): 84 checks — protocol framing 24, catalog mapping 22,
-  account/cart projection 33, live-gate harness 5 (fake children). Deterministic means no
+- `npm test` (offline, deterministic): 103 checks — protocol framing 24, catalog mapping 40,
+  account/cart projection 33, live-gate harness 6 (fake children). Deterministic means no
   network, no credential, fixed fixtures, and the same counts on every run; CI runs this
   on Node 22 and 24.
 - `npm run live:parse`: 2 checks, anonymous HTTP, asserts only that both shipped query

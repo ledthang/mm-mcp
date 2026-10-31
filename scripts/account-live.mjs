@@ -48,6 +48,7 @@ const PV = "2024-11-05";
 const CALL_TIMEOUT = 30000; // one request -> one envelope; server caps one upstream call at 25 s
 const MAX_LINE_BYTES = 2 * 1024 * 1024; // retained stdout cap per pending line (2 MiB, documented)
 const CLOSE_GRACE = 5000;
+const URL_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const GUEST_TOOLS = ["mm_search_products", "mm_get_product"];
 const AUTH_TOOLS = ["mm_auth_status", "mm_get_delivery_context", "mm_list_addresses", "mm_get_cart", "mm_cart_summary"];
 
@@ -256,39 +257,37 @@ async function main() {
       return { count: tools.length };
     });
 
-    // guest view: one search page, then exact detail on the known captured url_key
-    // (the search projection carries no url_key — a search row can never ground a
-    // detail call; this slug is from the 2026-10-31 ProductPage capture, public data)
-    const DETAIL_URL_KEY = "trung-ga-tuoi-cp-hop-10-qua-120167";
-    const DETAIL_SKU = "120167_21201677";
+    let searchPage = null;
     const rs = await st.call(4, "mm_search_products", { query: "trứng", page_size: 10 });
     check("S2.guest_search", () => {
       assert.ok(rs.ok, rs.why);
       assert.ok(!rs.isError, "live search must succeed");
       const p = JSON.parse(rs.text);
       assert.ok(Array.isArray(p.products), "products array");
-      assert.ok(p.products.length <= 10, "never over the requested page size");
+      assert.ok(p.products.length > 0 && p.products.length <= 10, "nonempty page within the requested page size");
       assert.ok(p.products.every((r) => Number.isSafeInteger(r.id) && r.id > 0 && typeof r.sku === "string" && r.sku !== "" && typeof r.name === "string" && r.name !== "" && typeof r.unit === "string" && r.unit !== "" && typeof r.stock_status === "string" && Number.isSafeInteger(r.quantity_step) && r.quantity_step >= 1 && vndRow(r)), "every row complete + valid VND");
       const skus = p.products.map((r) => r.sku);
       assert.equal(new Set(skus).size, skus.length, "no duplicate sku on the page");
-      assert.ok(!p.products.some((r) => "url_key" in r), "search rows carry no url_key (projection as designed)");
+      assert.ok(p.products.every((r) => typeof r.url_key === "string" && URL_KEY_RE.test(r.url_key)), "every search row carries a valid slug");
       assert.deepEqual(p.context, { store_code: process.env.MM_STORE_CODE, authenticated: false }, "guest context = the one configured store, never authenticated");
       assert.equal(p.price_status, "catalog-observed-not-guaranteed-payable");
       assert.ok(isoOk(st, p.observed_at), "observed_at inside the session window");
       assert.ok(Number.isSafeInteger(p.pagination.total_count) && p.pagination.total_count >= p.products.length, "observed total_count covers the page (mutable — no fixed count asserted)");
       assert.deepEqual({ page_index: p.pagination.page_index, page_size: p.pagination.page_size }, { page_index: 0, page_size: 10 });
+      searchPage = p;
       return { rows: p.products.length, total_count: p.pagination.total_count, store: p.context.store_code };
     });
-    const rd = await st.call(5, "mm_get_product", { url_key: DETAIL_URL_KEY, expected_sku: DETAIL_SKU });
+    const rd = searchPage ? await st.call(5, "mm_get_product", { url_key: searchPage.products[0].url_key, expected_sku: searchPage.products[0].sku }) : null;
     check("S2.guest_detail", () => {
+      assert.ok(searchPage, "successful nonempty guest search required");
       assert.ok(rd.ok, rd.why);
-      assert.ok(!rd.isError, "detail for the captured url_key must succeed");
+      assert.ok(!rd.isError, "detail for the search row must succeed");
       const p = JSON.parse(rd.text);
       assert.ok(isObj(p.product), "product object");
-      assert.equal(p.product.url_key, DETAIL_URL_KEY, "exact url_key, not search-as-detail");
-      assert.equal(p.product.sku, DETAIL_SKU, "expected_sku matched (fails closed otherwise)");
+      assert.ok(typeof p.product.url_key === "string" && URL_KEY_RE.test(p.product.url_key), "valid canonical slug");
+      assert.equal(p.product.sku, searchPage.products[0].sku, "expected_sku matched (fails closed otherwise)");
       assert.ok(moneyOk(p.product.price_vnd) && moneyOk(p.product.regular_price_vnd) && p.product.price_vnd <= p.product.regular_price_vnd, "valid VND");
-      assert.deepEqual(p.context, { store_code: process.env.MM_STORE_CODE, authenticated: false }, "guest context: guest detail is NOT account pricing");
+      assert.deepEqual(p.context, searchPage.context, "same guest store: guest detail is NOT account pricing");
       assert.equal(p.price_status, "catalog-observed-not-guaranteed-payable");
       assert.ok(isoOk(st, p.observed_at));
       return { detail: true };
