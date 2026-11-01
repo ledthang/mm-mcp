@@ -6,7 +6,7 @@
   "engines": { "node": ">=22" },
   "scripts": {
     "start": "node src/server.mjs",
-    "test": "node scripts/auth-setup.test.mjs && node scripts/stdio.test.mjs && node scripts/catalog.test.mjs && MM_LIVE_PARSE= node scripts/account.test.mjs && node scripts/account-live.test.mjs",
+    "test": "node scripts/auth-setup.test.mjs && node scripts/stdio.test.mjs && node scripts/catalog.test.mjs && MM_LIVE_PARSE= node scripts/account.test.mjs && node scripts/account-live.test.mjs && node scripts/catalog-live.test.mjs",
     "auth:setup": "node scripts/auth-setup.mjs",
     "live": "node scripts/catalog-live.mjs",
     "live:parse": "MM_LIVE_PARSE=1 node scripts/account.test.mjs",

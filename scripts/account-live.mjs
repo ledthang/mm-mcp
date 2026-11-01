@@ -54,7 +54,7 @@ const AUTH_TOOLS = ["mm_auth_status", "mm_get_delivery_context", "mm_list_addres
 
 const children = [];
 function hardKill(c) {
-  if (c.exitCode === null && c.signalCode === null) { try { c.kill("SIGKILL"); } catch { /* already gone */ } }
+  if (c.exitCode === null && c.signalCode === null) { try { c.kill("SIGKILL"); } catch { /* kill threw: not proof the child is gone — only 'close' confirms termination */ } }
 }
 function clean() { for (const c of children) hardKill(c); }
 process.on("exit", clean);
