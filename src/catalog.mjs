@@ -228,7 +228,7 @@ export function createCatalog({ fetchImpl = globalThis.fetch, env = process.env 
       if (!isInt(it.id, 0, Number.MAX_SAFE_INTEGER)) throw new CatalogError("BAD_UPSTREAM_DATA", "card item id");
       if (typeof it.name !== "string" || it.name === "") throw new CatalogError("BAD_UPSTREAM_DATA", "card item name");
       if (typeof it.unit_ecom !== "string" || it.unit_ecom === "") throw new CatalogError("BAD_UPSTREAM_DATA", "card item unit_ecom");
-      if (!isInt(it.mm_qty_step, 1, Number.MAX_SAFE_INTEGER)) throw new CatalogError("BAD_UPSTREAM_DATA", "card item mm_qty_step");
+      if (!Number.isFinite(it.mm_qty_step) || it.mm_qty_step <= 0) throw new CatalogError("BAD_UPSTREAM_DATA", "card item mm_qty_step");
       if (typeof it.stock_status !== "string" || it.stock_status === "") throw new CatalogError("BAD_UPSTREAM_DATA", "card item stock_status");
       // slug is kept as-is (validated, never invented): it is what mm_get_product needs for
       // this same store, and a search card without a usable slug owes the caller no detail link
@@ -323,7 +323,7 @@ export function createCatalog({ fetchImpl = globalThis.fetch, env = process.env 
     }
     if (typeof it.name !== "string" || it.name === "") throw new CatalogError("BAD_UPSTREAM_DATA", "product name");
     if (typeof it.unit_ecom !== "string" || it.unit_ecom === "") throw new CatalogError("BAD_UPSTREAM_DATA", "product unit_ecom");
-    if (!isInt(it.mm_qty_step, 1, Number.MAX_SAFE_INTEGER)) throw new CatalogError("BAD_UPSTREAM_DATA", "product mm_qty_step");
+    if (!Number.isFinite(it.mm_qty_step) || it.mm_qty_step <= 0) throw new CatalogError("BAD_UPSTREAM_DATA", "product mm_qty_step");
     if (typeof it.stock_status !== "string" || it.stock_status === "") throw new CatalogError("BAD_UPSTREAM_DATA", "product stock_status");
     const reg = isObj(it.price) && isObj(it.price.regularPrice) ? it.price.regularPrice.amount : null;
     const mp = isObj(it.price_range) ? it.price_range.maximum_price : null;

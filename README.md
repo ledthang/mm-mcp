@@ -228,6 +228,11 @@ line or a selected address can never be changed through this server.
   a payable guarantee.
 - `stock_status` is the upstream label (`IN_STOCK`/`OUT_OF_STOCK`), not an inventory
   count or purchasability guarantee.
+- `quantity_step` is a positive finite number in both search and detail, preserved
+  unchanged from numeric `mm_qty_step` (including `0.5`). No coercion, default,
+  rounding or mass conversion; step is not package weight. Missing, null, string,
+  boolean, non-finite, zero or negative steps fail `BAD_UPSTREAM_DATA`. Prices remain
+  non-negative safe-integer VND under the existing price contract.
 - `member_offer` is the raw upstream MCard offer blob, never your payable price.
 - Guest catalog requests carry no cookies and no auth header — plain `GET` to
   `https://online.mmvietnam.com/graphql` with only the `store` header.

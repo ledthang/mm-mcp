@@ -222,6 +222,45 @@ async function main() {
     assert.ok(!("member_price_vnd" in p.products[0]), "no payable-member-price invention");
   });
 
+  await t("search + detail: positive finite quantity_step preserved, price unchanged", async () => {
+    const skus = ["203831_22038319", "2315_20023157", "193172_21931727", "378659_23786592"];
+    for (const step of [0.5, 0.125, 1.5, Number.MIN_VALUE, Number.MAX_VALUE]) {
+      const cards = skus.map((sku) => ({ ...A.card, sku, unit_ecom: "Ký", mm_qty_step: step }));
+      const search = mkFetch([CARD(cards), ENR(skus.map((sku) => enrichItem(sku, 31000, 31000)))]);
+      const products = payload(await search.run({ query: "thịt" })).products;
+      assert.deepEqual(products.map((product) => product.sku), skus);
+      for (const product of products) {
+        const detail = mkFetch([DETAIL([detailItem({ sku: product.sku, unit_ecom: "Ký", mm_qty_step: step })])]);
+        const result = payload(await detail.runDetail({ url_key: product.url_key, expected_sku: product.sku })).product;
+        for (const projected of [product, result]) {
+          assert.equal(projected.quantity_step, step);
+          assert.equal(projected.unit, "Ký");
+          assert.equal(projected.price_vnd, 31000);
+          assert.equal(projected.regular_price_vnd, 31000);
+        }
+      }
+    }
+  });
+
+  await t("search + detail: invalid quantity_step fails closed", async () => {
+    for (const step of [NaN, Infinity, -Infinity, 0, -0.5, "0.5", true, false, null, undefined]) {
+      for (const method of ["mm_search_products", "mm_get_product"]) {
+        const item = method === "mm_search_products" ? { ...A.card, mm_qty_step: step } : detailItem({ mm_qty_step: step });
+        const response = method === "mm_search_products" ? CARD([item]) : DETAIL([item]);
+        let json = JSON.stringify(response);
+        if (step === Infinity || step === -Infinity) {
+          json = json.replace('"mm_qty_step":null', `"mm_qty_step":${step < 0 ? "-" : ""}1e400`);
+        }
+        const harness = mkFetch([{ chunks: [Buffer.from(json)] }]);
+        const args = method === "mm_search_products" ? { query: "thịt" } : { url_key: DETAIL_URL_KEY };
+        const out = await harness.cat.callTool(method, args);
+        assert.equal(out.isError, true, `${method}: ${String(step)}`);
+        assert.match(text(out), /^BAD_UPSTREAM_DATA: .* mm_qty_step$/);
+        assert.equal(harness.calls.length, 1, "no enrichment or retries on invalid step");
+      }
+    }
+  });
+
   await t("shuffled enrichment: join by exact sku still maps right", async () => {
     const { run } = mkFetch([OK_PAGE[0], ENR([C.enrich, A.enrich, B.enrich])]);
     const p = payload(await run());
