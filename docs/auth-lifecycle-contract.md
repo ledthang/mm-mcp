@@ -31,7 +31,9 @@ and security contract; the observed refresh success does not implement that cont
 
 ## Historical static evidence and confidence
 
-Public source: `/home/openclaw/.hermes/workspace/mm-asset-client.621acc48af8c317cdd54.js`
+Public source: `<capture>/mm-asset-client.621acc48af8c317cdd54.js`
+(`<capture>` is this evidence's local capture directory, kept outside the plugin
+repo and not committed; set it wherever you re-fetch the public chunk.)
 
 - File size: 1,529,158 bytes; decoded JavaScript length: 1,519,515 UTF-16 code units.
 - SHA-256: `9a5bceab01afed2fefcd3ba5a6986cad1b3bbdd34907e73b79ed1401c388f615`.
@@ -50,6 +52,11 @@ Public source: `/home/openclaw/.hermes/workspace/mm-asset-client.621acc48af8c317
   logout, cart, or address mutation was performed.
 
 ### Source index
+
+Minified identifiers in the Evidence column (`LFJS`, `YRuz`, `setToken`, `yu8+`, `6i0m`,
+`kSvd.b`, `dhg2`) are labels carried over from the earlier discovery notes. They are **unverified
+names** — ranges are the evidence, not the labels; a mislabeled span shows up as text that does
+not match its description. Do not quote an identifier as fact without re-checking its range.
 
 | ID | UTF-8 bytes | UTF-16 code units | Evidence |
 | --- | --- | --- | --- |
@@ -71,10 +78,12 @@ Public source: `/home/openclaw/.hermes/workspace/mm-asset-client.621acc48af8c317
 | S16 | [778361, 781863) | [771959, 775461) | `kSvd.b`: `GetStoreInformationQuery` document |
 | S17 | [690175, 690823) | [684620, 685268) | `dhg2`: merged cart's `CheckoutPageFragment` |
 
-Reproduce any excerpt without executing the bundle or reading credentials:
+Reproduce any excerpt without executing the bundle or reading credentials
+(`CAPTURE` = your local capture directory holding the fetched chunk):
 
 ```sh
-node --input-type=module -e 'import { readFileSync } from "node:fs"; const source = readFileSync(process.argv[1]); console.log(source.subarray(595139, 597058).toString("utf8"));' /home/openclaw/.hermes/workspace/mm-asset-client.621acc48af8c317cdd54.js
+CAPTURE=/path/to/capture   # wherever you re-fetched the public chunk
+node --input-type=module -e 'import { readFileSync } from "node:fs"; const source = readFileSync(process.argv[1]); console.log(source.subarray(595139, 597058).toString("utf8"));' "$CAPTURE/mm-asset-client.621acc48af8c317cdd54.js"
 ```
 
 ## Login/token issuance found in public source
@@ -86,7 +95,7 @@ selected fields. Whitespace is normalized and source comments omitted. These are
 ### Ordinary email/password sign-in: lazy discovery closed
 
 The primary supplied HTTP-200 public captures in
-`/home/openclaw/.hermes/workspace/mm-public-auth/`; their HTTP status is supplied
+`<capture>/mm-public-auth/`; their HTTP status is supplied
 provenance, not independently replayed here. Homepage L1 names runtime URL
 `https://cdn-b2c.mmpro.vn/runtime.33fbd54608f40e620179.js` (saved as `runtime.js`)
 and the same MAIN filename as above. Runtime L2 sets webpack public path to
@@ -441,7 +450,11 @@ results. Current implementation validation is recorded separately below.
 Rerun `npm test` in an executor that permits the suite's child processes before
 claiming the existing offline gate passes. No unrelated runtime/test edits made.
 
-## Bounded CLI implementation validation
+## Historical bounded CLI validation (superseded)
+
+The restricted worker results below are historical, not the current gate state.
+Primary host re-ran all six suites on 2026-11-01 under synthetic HOME/XDG:
+212 checks passed, two live-only checks skipped, exit 0. See [testing.md](testing.md).
 
 - Focused fake-only suite: `node scripts/auth-setup.test.mjs` passed 74/74 checks.
   Covers exact requests, no login cookies/authorization, CAPTCHA/config fail-closed,

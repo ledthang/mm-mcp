@@ -8,20 +8,36 @@ Rev 1 of this document said add/update GraphQL documents were **missing**. That 
 - **Update** — `updateItemInCart` (6 records), rooted at `updateCartItems`: 3 × single-line `($cartId: String!, $itemId: ID!, $quantity: Float!)` with input field `cart_item_uid`, and 3 × list `($cartId: String!, $cartItems: [CartItemUpdateInput!]!)`.
 - **Remove** — `RemoveItemForMiniCart` (unchanged from rev 1), rooted at `removeItemFromCart`, input `cart_item_uid`.
 
-What the sources prove: document text, operation/root-field names, declared variable types, input field names where inline, and selection shape. What they do **not** prove, and nothing here claims: absolute-versus-delta quantity, merge/replace behaviour, quantity-step enforcement, live success of any operation, or address binding. The protected live cart (2 lines, total quantity 1.5) was not touched by this task.
+What the sources prove: document text, operation/root-field names, declared variable types, input field names where inline, and selection shape. What they do **not** prove, and nothing here claims: absolute-versus-delta quantity, merge/replace behaviour, quantity-step enforcement, live success of any operation, or address binding. No live cart was touched by this task.
 
 Scope: static reads of supplied public JS only. No network, no login, no private auth/profile/vault/config/env, no primary probe scripts, no cart change, no commit, no push. Only this document changed; `scripts/cart_contract_extract.py` unchanged by this task (an earlier separate repair made it write into a per-run `mkdtemp` dir mode `0700` with the artifact at mode `0600` and strict UTF-8 — hence the changing output path above, old predictable path never written) — still preserved for separate review. No backend/schema behaviour inferred from Magento convention.
 
-User-supplied baseline, **not re-probed**: primary live cart **2 lines, total quantity 1.5**; both protected, neither a test fixture. Address observation: `customerCart.shipping_addresses` queried with `customer_address_id`, `city_code`, `ward_code` returned HTTP 200, but the current row has all three missing and `is_new_administrative: false`. HTTP success and store selection do **not** establish address binding.
+Baseline guard (generic): the live cart is protected and is **not** a test fixture. Any future
+test must use a synthetic or explicitly approved disposable cart. Address binding is
+unverified — a `customerCart.shipping_addresses` query shape exists in the public sources, but
+nothing here proves the live cart's address fields, and HTTP success and store selection do
+**not** establish address binding.
 
 ## Reproducibility
 
-Paths relative to `/home/openclaw/.hermes/workspace/`. **Offsets are the zero-based UTF-8 byte offset of the opening JS quote**, and each record's `document` length is the decoded length, so the raw span is `[offset, offset + encoded_span)` where the encoded span is longer than the decoded text because newlines are stored as the two-character escape `\n`. Ranges below are given as `offset … +decoded_len` and must be read as *start offset + decoded length*, not as contiguous raw byte bounds. Fragment spreads require their definitions — a snippet with a spread is not a standalone request.
+Paths here are relative to the directory that **contains** this repo: the public chunks live in a
+sibling capture directory `mm-public-auth/` (not committed, not inside the repo). **Offsets are the
+zero-based UTF-8 byte offset of the opening JS quote**, and each record's `document` length is the
+decoded length, so the quoted span is `[offset, offset + encoded_span)` where the encoded span is
+longer than the decoded text because newlines are stored as the two-character escape `\n`. Ranges
+below are given as `offset … +decoded_len` and must be read as *start offset + decoded length*,
+not as contiguous byte bounds. Fragment spreads require their definitions — a snippet with a spread
+is not a standalone request.
 
-Runnable extractor (stdlib only, read-only over the four public chunks; prints counts and assert results only, never documents — this run is itself the required check):
+Runnable extractor `scripts/cart_contract_extract.py` (stdlib only, read-only over the four
+public chunks; prints counts and assert results only, never documents — this run is itself the
+required check). It is **not runnable out of the box from this repo alone**: it reads
+`../mm-public-auth/` (one level above the repo root) and fails with `AssertionError` if that
+sibling capture directory is missing. Re-fetch the chunks into that sibling directory first.
 
 ```bash
-cd /home/openclaw/.hermes/workspace/mm-cart-contract-next && python3 scripts/cart_contract_extract.py
+# run from the repo root; requires ../mm-public-auth/ to exist with the four chunks
+python3 scripts/cart_contract_extract.py
 # stdout ends: documents written: 13 -> /tmp/mm-cart-operations-<random>/mm-cart-operations.json
 #              count AddProductToCart: 1  count AddItemToCart: 6  count updateItemInCart: 6
 #              quote styles: {"'": 6, '"': 7}  decode_failures: 0
@@ -196,7 +212,10 @@ Rev 1 searched only `mm-asset-client.621acc48af8c317cdd54.js` (A) and `mm-public
 
 **Not known, not asserted:** whether `Float` means absolute replacement or a delta; how `mm_qty_step`/`unit_ecom` constrain values; rounding; min/max; whether add increments an existing line or creates a new one; whether `quantity: 0` in an update means remove. None is provable from the literals.
 
-User baseline shows fractional aggregate quantity (1.5) in this cart — not a universal allowed increment. Preserve `1.5`; never truncate, never default every line to one, never equate line count with total quantity. A selects `total_summary_quantity_including_config` in `CartTriggerFragment` `[617987, 618127)` — a distinct counter, not interchangeable with `total_quantity`.
+Cart quantities may be **fractional** (for example `1.5`) — not a universal allowed increment.
+Preserve fractions; never truncate, never default every line to one, never equate line count with
+total quantity. A selects `total_summary_quantity_including_config` in `CartTriggerFragment`
+`[617987, 618127)` — a distinct counter, not interchangeable with `total_quantity`.
 
 Future boundary validation must reject nonfinite/nonpositive quantities and invalid identifiers and use decimal-safe step checks against *verified* product constraints, inventing no default step. Quantity zero must require explicit remove intent. All write paths stay disabled until absolute/delta semantics and subtype rules are verified live.
 
@@ -349,4 +368,5 @@ Fake acceptance must pass before any separately authorized live write; none has 
 8. Deterministic fake suite passing.
 9. Separate explicit approval plus an isolated, non-protected live fixture.
 
-**This document verifies document text and offsets only — it does not verify the write contract end-to-end, and authorizes no implementation and no live experiment. Protected live cart (2 lines, qty 1.5) untouched.**
+**This document verifies document text and offsets only — it does not verify the write contract
+end-to-end, and authorizes no implementation and no live experiment. No live cart was touched.**
