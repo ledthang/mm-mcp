@@ -139,7 +139,8 @@ async function acceptance(live) {
   const check = (test) => { test(); checks += 1; };
   const rpc = async (method, params) => {
     const id = ++requestId;
-    const reply = session.strict(await session.ask(id, method, params), id);
+    // metadata on every request: the walk must still succeed (accepted, then ignored)
+    const reply = session.strict(await session.ask(id, method, { ...params, _meta: { scenario: live ? "live" : "fixture" } }), id);
     assert.equal(reply.ok, true);
     return reply.fr;
   };

@@ -10,7 +10,9 @@ npm test
 Default mode is **offline fixture acceptance, not live shopping evidence**.
 It spawns the shipped `src/server.mjs`, sends newline JSON-RPC `initialize`,
 `notifications/initialized`, `tools/list`, and `tools/call` over real child stdio.
-It never fabricates MCP responses or calls tool implementations directly.
+Every request frame carries `params._meta` (`{"scenario":"fixture"}` or `{"scenario":"live"}`),
+so the server's request-metadata path is exercised end to end; notifications carry no
+`_meta`. It never fabricates MCP responses or calls tool implementations directly.
 
 The upstream origin is fixed in the shipped modules. Offline mode uses Node's
 `--import` to load this same script in the child and redirect native `fetch`

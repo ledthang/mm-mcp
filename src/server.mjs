@@ -2,7 +2,9 @@
 // + T3 authenticated read tools).
 // Stdlib only + native fetch via src/catalog.mjs (guest) and src/account.mjs (auth).
 // Bytes split on byte 10, decoded to utf8 only once a line is complete (so a multibyte
-// char split across chunks survives). A line over MAX_LINE_BYTES is NEVER dispatched - its
+// char split across chunks survives), and decoding is FATAL: invalid bytes are a Parse
+// error under this frame's bounds, never a silent U+FFFD substitution.
+// A line over MAX_LINE_BYTES is NEVER dispatched - its
 // kept head can still parse, and that is not validity. Oversized input is discarded until
 // its newline, buying exactly one Parse error, then service resumes. One reply per line,
 // written and awaited before the next bytes are read (backpressure, no promise queue).
@@ -30,12 +32,20 @@ const INVALID_PARAMS = -32602;
 const INIT_KEYS = ["protocolVersion", "clientInfo", "capabilities"];
 const LIST_KEYS = ["cursor"];
 const CALL_KEYS = ["name", "arguments"];
+const META = "_meta"; // request metadata: a sibling of the method args, never one of them
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const isNonEmpty = (v) => typeof v === "string" && v.length > 0;
-const isId = (v) => typeof v === "string" || (typeof v === "number" && Number.isFinite(v));
-const extraKeys = (params, allowed) => Object.keys(params).filter((k) => !allowed.includes(k));
+// MCP requires a string or an integer id: 2.5 is malformed, not a valid numeric id.
+const isId = (v) => typeof v === "string" || Number.isInteger(v);
+// `_meta` is validated on its own (present => must be an object) and then ignored; the
+// per-method allowlists stay strict, so an unknown argument is still refused.
+const metaBad = (params) => Object.prototype.hasOwnProperty.call(params, META) && !isObj(params[META]);
+const extraKeys = (params, allowed) =>
+  Object.keys(params).filter((k) => !allowed.includes(k) && k !== META);
 const isBlank = (buf) => !buf.some((b) => b > 0x20); // blank/CRLF-only line: nothing to answer
+// Fatal: invalid utf-8 throws instead of becoming U+FFFD under the frame's own bounds.
+const utf8 = new TextDecoder("utf-8", { fatal: true });
 
 const err = (id, code, message) => ({ jsonrpc: "2.0", id, error: { code, message } });
 const ok = (id, result) => ({ jsonrpc: "2.0", id, result });
@@ -54,12 +64,15 @@ export async function dispatch(state, line) {
   if (msg.jsonrpc !== "2.0") return err(null, INVALID_REQUEST, 'jsonrpc must be "2.0"');
   if (!isNonEmpty(msg.method)) return err(null, INVALID_REQUEST, "method must be a non-empty string");
   if (!("id" in msg)) return null; // notification: no reply, and no state change
-  if (!isId(msg.id)) return err(null, INVALID_REQUEST, "id must be a string or number");
+  if (!isId(msg.id)) return err(null, INVALID_REQUEST, "id must be a string or an integer");
 
   const id = msg.id;
   const params = msg.params ?? {};
   if (!isObj(params)) return err(id, INVALID_PARAMS, "params must be an object");
   if (msg.method !== "initialize" && !state.initialized) return err(id, INVALID_REQUEST, "not initialized");
+  // Request-level metadata is checked here, apart from the method arguments: valid
+  // metadata is accepted and ignored, a non-object `_meta` is refused on any method.
+  if (metaBad(params)) return err(id, INVALID_PARAMS, "_meta must be an object");
 
   switch (msg.method) {
     case "initialize": {
@@ -82,7 +95,7 @@ export async function dispatch(state, line) {
       });
     }
     case "ping": {
-      if (Object.keys(params).length > 0) return err(id, INVALID_PARAMS, "ping takes no params");
+      if (extraKeys(params, []).length > 0) return err(id, INVALID_PARAMS, "ping takes no params");
       return ok(id, {});
     }
     case "tools/list": {
@@ -116,8 +129,15 @@ export async function runStdio(input = process.stdin, output = process.stdout) {
   const writeLine = (env) =>
     new Promise((res, rej) => output.write(`${JSON.stringify(env)}\n`, (e) => (e ? rej(e) : res())));
 
-  const answer = async (line) => { // whole, in-cap lines only
-    const envelope = await dispatch(state, line.toString("utf8"));
+  const answer = async (line) => { // whole, in-cap lines only; bad utf-8 owes one Parse error
+    let text;
+    try {
+      text = utf8.decode(line);
+    } catch {
+      await writeLine(err(null, PARSE, "Parse error: invalid UTF-8"));
+      return;
+    }
+    const envelope = await dispatch(state, text);
     if (envelope) await writeLine(envelope);
   };
 

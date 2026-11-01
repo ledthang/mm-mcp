@@ -23,8 +23,11 @@ async function t(name, fn) {
   }
 }
 
-function start() {
-  const child = spawn(process.execPath, [SERVER], { stdio: ["pipe", "pipe", "pipe"] });
+function start(extraEnv = {}) {
+  const child = spawn(process.execPath, [SERVER], {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: { ...process.env, ...extraEnv },
+  });
   const frames = [];
   const waiters = [];
   const stderr = [];
@@ -375,6 +378,159 @@ async function main() {
     assert.equal(await c.next(300), null, "no second reply for the same line");
     const back = await c.ping(56);
     assert.deepEqual(back.result, {}, "recovered after cap-crossing line");
+    c.stop();
+  });
+
+  // ---- request metadata (_meta) + id conformance + fatal utf-8 ----
+
+  await t("initialize with valid params._meta: accepted, session opens, list works", async () => {
+    const c = start();
+    const r = await c.call({ jsonrpc: "2.0", id: 200, method: "initialize", params: { protocolVersion: PV, clientInfo: { name: "probe", version: "1" }, capabilities: {}, _meta: { trace: "x" } } });
+    assert.equal(r.result.protocolVersion, PV, "metadata must not block initialize");
+    assert.equal("error" in r, false);
+    const l = await c.call({ jsonrpc: "2.0", id: 201, method: "tools/list" });
+    assert.equal(l.result.tools.length, 7, "session opened despite metadata");
+    c.stop();
+  });
+
+  await t("initialize with empty _meta (SDK default shape): accepted", async () => {
+    const c = start();
+    const r = await c.call({ jsonrpc: "2.0", id: 202, method: "initialize", params: { protocolVersion: PV, clientInfo: { name: "mcp", version: "0.1.0" }, capabilities: {}, _meta: {} } });
+    assert.deepEqual(r.result.serverInfo, { name: "mm-mcp", version: "0.1.0" });
+    c.stop();
+  });
+
+  await t("initialize with non-object _meta: -32602, state unchanged", async () => {
+    const c = start();
+    for (const [i, meta] of ["\"x\"", "5", "true", "[1,2]", "null"].entries()) {
+      const id = 210 + i;
+      const r = await c.call(JSON.parse(`{"jsonrpc":"2.0","id":${id},"method":"initialize","params":{"protocolVersion":"${PV}","clientInfo":{"name":"t","version":"1"},"capabilities":{},"_meta":${meta}}}`));
+      assert.equal(r.error.code, -32602, `_meta=${meta}`);
+      assert.match(r.error.message, /_meta/, `_meta=${meta} names the key`);
+      assert.equal((await c.ping(id + 100)).error.code, -32600, `_meta=${meta}: still un-initialized`);
+    }
+    c.stop();
+  });
+
+  await t("initialize with _meta AND unknown extra key: -32602 names the extra key", async () => {
+    const c = start();
+    const r = await c.call({ jsonrpc: "2.0", id: 205, method: "initialize", params: { protocolVersion: PV, clientInfo: { name: "t", version: "1" }, capabilities: {}, _meta: { a: 1 }, bogus: true } });
+    assert.equal(r.error.code, -32602);
+    assert.match(r.error.message, /bogus/, "strict allowlist retained for real arguments");
+    assert.equal((await c.ping(206)).error.code, -32600);
+    c.stop();
+  });
+
+  await t("ping with valid _meta: empty result; non-object _meta: -32602", async () => {
+    const c = await live();
+    assert.deepEqual(await c.call({ jsonrpc: "2.0", id: 210, method: "ping", params: { _meta: { attempt: 2 } } }), { jsonrpc: "2.0", id: 210, result: {} });
+    assert.equal((await c.call({ jsonrpc: "2.0", id: 211, method: "ping", params: { _meta: "nope" } })).error.code, -32602);
+    assert.equal((await c.call({ jsonrpc: "2.0", id: 212, method: "ping", params: { _meta: [] } })).error.code, -32602);
+    assert.equal((await c.call({ jsonrpc: "2.0", id: 213, method: "ping", params: { foo: 1 } })).error.code, -32602, "unknown param still refused");
+    assert.deepEqual((await c.ping(214)).result, {}, "session survives");
+    c.stop();
+  });
+
+  await t("tools/list with valid _meta (bare and with cursor): same single page", async () => {
+    const c = await live();
+    const a = await c.call({ jsonrpc: "2.0", id: 220, method: "tools/list", params: { _meta: { trace: "a" } } });
+    assert.equal(a.result.tools.length, 7);
+    const b = await c.call({ jsonrpc: "2.0", id: 221, method: "tools/list", params: { cursor: "next", _meta: { trace: "b" } } });
+    assert.deepEqual(b.result.tools, a.result.tools, "cursor + metadata: same single page");
+    assert.equal((await c.call({ jsonrpc: "2.0", id: 222, method: "tools/list", params: { cursor: 42, _meta: {} } })).error.code, -32602, "bad cursor with metadata still -32602");
+    assert.equal((await c.call({ jsonrpc: "2.0", id: 223, method: "tools/list", params: { _meta: 7 } })).error.code, -32602);
+    c.stop();
+  });
+
+  await t("tools/call with valid _meta: dispatched, no network (no store env), recovery after", async () => {
+    const c = start({ MM_STORE_CODE: "" }); // no store env => the tool must fail before any request
+    await c.init();
+    const r = await c.call({ jsonrpc: "2.0", id: 230, method: "tools/call", params: { name: "mm_search_products", arguments: { query: "rice" }, _meta: { trace: "t" } } }, 4000);
+    assert.equal(r.error, undefined, "metadata must not block tools/call");
+    assert.equal(r.result.isError, true, "fails on MISSING_STORE_ENV only");
+    assert.match(r.result.content[0].text, /^MISSING_STORE_ENV/);
+    assert.deepEqual((await c.ping(231)).result, {}, "session intact");
+    c.stop();
+  });
+
+  await t("tools/call: strict arguments kept; _meta not an argument; bad _meta -32602", async () => {
+    const c = start({ MM_STORE_CODE: "" });
+    await c.init();
+    const badArg = await c.call({ jsonrpc: "2.0", id: 232, method: "tools/call", params: { name: "mm_search_products", arguments: { query: "rice", bogus: 1 }, _meta: { trace: "t" } } }, 4000);
+    assert.equal(badArg.error, undefined, "an invalid argument is a tool result, not a dispatch error");
+    assert.equal(badArg.result.isError, true);
+    assert.match(badArg.result.content[0].text, /INVALID_ARGS: unknown argument\(s\): bogus/, "strict tool argument validation preserved");
+    const noName = await c.call({ jsonrpc: "2.0", id: 233, method: "tools/call", params: { _meta: { a: 1 } } });
+    assert.equal(noName.error.code, -32602, "missing name is still a dispatch error");
+    const badMeta = await c.call({ jsonrpc: "2.0", id: 234, method: "tools/call", params: { name: "mm_get_cart", arguments: {}, _meta: "x" } });
+    assert.equal(badMeta.error.code, -32602);
+    assert.equal((await c.ping(235)).result && true, true, "session survives");
+    c.stop();
+  });
+
+  await t("fractional id: -32600 with id null, next valid line recovers", async () => {
+    const c = await live();
+    const r = await c.call({ jsonrpc: "2.0", id: 2.5, method: "ping" });
+    assert.equal(r.error.code, -32600, "fractional numeric id is malformed");
+    assert.equal(r.id, null, "a rejected id is never echoed");
+    assert.equal((await c.ping(240)).result && true, true, "recovered");
+    c.stop();
+  });
+
+  await t("Infinity id (1e999): -32600; integer and string ids echo unchanged", async () => {
+    const c = await live();
+    c.write('{"jsonrpc":"2.0","id":1e999,"method":"ping"}\n');
+    const f = await c.next();
+    assert.equal(f.error.code, -32600);
+    assert.equal(f.id, null);
+    assert.equal((await c.call({ jsonrpc: "2.0", id: 241, method: "ping" })).id, 241);
+    assert.equal((await c.call({ jsonrpc: "2.0", id: "0", method: "ping" })).id, "0");
+    c.stop();
+  });
+
+  await t("invalid UTF-8 byte in a line: one Parse error, next valid line recovers", async () => {
+    const c = await live();
+    // {"jsonrpc":"2.0","id":250,"method":"pi<0xff>ng"}  — 0xff cannot be utf-8
+    const bytes = Buffer.concat([
+      Buffer.from('{"jsonrpc":"2.0","id":250,"method":"pi', "utf8"),
+      Buffer.from([0xff]),
+      Buffer.from('ng"}\n', "utf8"),
+    ]);
+    c.write(bytes);
+    const f = await c.next();
+    assert.equal(f.error.code, -32700, "invalid encoding is a Parse error, never U+FFFD accept");
+    assert.equal(f.id, null);
+    assert.equal(await c.next(250), null, "exactly one reply for the bad line");
+    assert.deepEqual((await c.ping(251)).result, {}, "recovered after invalid utf-8");
+    c.stop();
+  });
+
+  await t("invalid UTF-8 split across two chunks: one Parse error, then recovery", async () => {
+    const c = await live();
+    // frame bytes split at a chunk boundary, with 0xfe (an invalid lead byte) in the tail
+    const head = Buffer.from('{"jsonrpc":"2.0","id":2', "utf8");
+    const tail = Buffer.from('60,"method":"ping"}\n', "utf8");
+    c.write(head);
+    await new Promise((r) => setTimeout(r, 40));
+    c.write(Buffer.concat([Buffer.from([0xfe]), tail]));
+    const f = await c.next();
+    assert.equal(f.error.code, -32700, "invalid bytes reassembled across chunks still rejected");
+    assert.equal(f.id, null);
+    assert.equal(await c.next(250), null, "single reply only");
+    assert.deepEqual((await c.ping(261)).result, {}, "recovered");
+    c.stop();
+  });
+
+  await t("valid multibyte straddling a chunk boundary is NOT an error", async () => {
+    const c = await live();
+    const bytes = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: "héllo-270", method: "ping" }) + "\n", "utf8");
+    const at = bytes.indexOf(0xa9); // second byte of é
+    assert.ok(bytes[at - 1] === 0xc3);
+    c.write(bytes.subarray(0, at)); // split inside the pair
+    await new Promise((r) => setTimeout(r, 40));
+    c.write(bytes.subarray(at));
+    const f = await c.next();
+    assert.equal(f.id, "héllo-270", "valid pair split across chunks answers normally");
     c.stop();
   });
 
