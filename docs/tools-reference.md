@@ -1,9 +1,9 @@
 # Tools, configuration and error codes
 
-Exact reference for the seven tools, the MCP framing this server accepts, and every error
+Exact reference for the ten tools, the MCP framing this server accepts, and every error
 code it can return. Everything here is read straight out of `src/server.mjs`,
-`src/catalog.mjs` and `src/account.mjs` — if this page and the source disagree, the
-source is right.
+`src/catalog.mjs`, `src/account.mjs` and `src/cart.mjs` — if this page and the source
+disagree, the source is right.
 
 ## Framing
 
@@ -56,7 +56,8 @@ SDK 2.0.0 in the Hermes venv completed initialize / tools/list / tools/call agai
 server (PASS, protocol `2024-11-05`, 7 tools, no upstream calls), but that is SDK evidence
 with no Hermes configuration loaded; the configured Hermes session was not opened, so it
 remains unverified. The old "Hermes fails to connect" note predates this fix and is not
-supported by the SDK run either way.
+supported by the SDK run either way. That run listed 7 tools: it predates the three cart
+write tools and has not been repeated, so the cart tools have no SDK evidence either.
 
 ### Request ids: string or integer only (fixed locally 2026-11-01)
 
@@ -97,8 +98,10 @@ Both need `MM_STORE_CODE` (format `b2c_<1–8 digits>_vi`); with it unset they f
 `Authorization`. Each request has a 25 s deadline (`AbortSignal.timeout`) and its response
 body is capped at 2 MiB while streaming. `mm_search_products` issues two such requests in
 sequence, so its ceiling is roughly 50 s; `mm_get_product` issues one, so 25 s. A caller or
-harness that waits less than that (the bundled stdio harness waits 30 s) can time out a
-request that is still legitimately in flight — a harness limit, not a server failure.
+`harness that waits less than that can time out a request that is still legitimately in
+flight — a harness limit, not a server failure. `spawnGate` waits 30 s per request by default
+and accepts a named per-call bound (1…90 s) for exactly this reason: the cart write gate names
+80 s for its one write call, every other call keeps 30 s.
 
 ### `mm_search_products`
 
@@ -123,9 +126,15 @@ with its own 25 s deadline and 2 MiB cap — total wall clock up to roughly 50 s
 ```
 
 `quantity_step` is preserved exactly as upstream publishes it (fractions such as `0.5`
-are legitimate ordering steps, not errors). `promotion` is a label or `null`;
-`member_offer` is the raw MCard offer blob, never your payable price. An empty page is a
-valid empty result and owes no enrichment.
+are legitimate ordering steps, not errors). `unit` is nullable upstream metadata: `null`
+means "no unit label published" and is a valid answer (7 of the 11 rows in the real
+`ức gà` answer, store `b2c_70010_vi`) — it is never invented as `Kg`/`Hộp`.
+`price_vnd` and `regular_price_vnd` are two independently observed cells: they may be
+equal, and `price_vnd` may sit ABOVE `regular_price_vnd` (live proof
+`SKU351030_23510302`: final `55000`, regular `52000`, discount `0`). Nothing here asserts
+a discount; both are VND integers, catalog-observed, not payable prices. `promotion` is a
+label or `null`; `member_offer` is the raw MCard offer blob, never your payable price.
+An empty page is a valid empty result and owes no enrichment.
 
 ### `mm_get_product`
 
@@ -147,7 +156,9 @@ zero is `PRODUCT_NOT_FOUND`, more than one is `MULTIPLE_PRODUCTS`. Identity rule
 - There is no SKU-only lookup: a SKU on its own is not a valid argument, because the
   captured card path shows the `sku:{eq}` filter is ignored upstream.
 
-Returns `{ product: { …same row keys… }, context, price_status, observed_at }`. Prices
+Returns `{ product: { …same row keys… }, context, price_status, observed_at }`. Same row
+contract as search: `unit` may be `null`, and `price_vnd` / `regular_price_vnd` are two
+independently observed cells (`price_vnd` may exceed `regular_price_vnd`). Prices
 are the guest view of the configured store: observed, not payable, and never member
 pricing (this server has no authenticated catalog view at all).
 
@@ -181,30 +192,110 @@ Things to read carefully in those shapes:
   `REQUIRES_LOGIN`, never a fabricated empty one.
 - Cart money cells must be non-negative, finite VND; anything else fails closed.
 
+## Authenticated cart write tools (`src/cart.mjs`)
+
+Three tools, and they are the only path in this server that changes anything upstream.
+**Implemented and offline-tested with fakes; NOT live-verified** — no cart write has ever
+reached `https://online.mmvietnam.com` from this repository. Run
+`MM_MCP_LIVE=1 MM_CART_WRITE_APPROVED=i_understand_this_changes_the_cart MM_LIVE_SKU=<sku> MM_LIVE_QTY=<n> npm run live:cart`
+to exercise one real add; until such a run reports an exact increment, every claim below is
+contract + fake evidence. The one approved run so far (2026-11-01) was blocked before
+dispatch: its pre-read answered `Syntax Error` (one missing brace, since fixed; the fixed
+document is proven to parse by `npm run proof:cart`), so zero mutations were sent.
+
+Every call follows the same sequence, in this order, and never out of it:
+
+1. arguments checked strictly (`additionalProperties: false`, nothing unknown reaches the wire);
+2. `confirm` gate — missing is `CONFIRM_REQUIRED`, anything other than exactly `true` is
+   `NOT_CONFIRMED`; in both cases **zero** requests are made;
+3. credential read (the same strict loader as `src/account.mjs`) — a local credential problem
+   is `REQUIRES_LOGIN` with zero requests;
+4. local intent guard: an identical intent already dispatched in this process is answered
+   from the recorded report with zero new requests (local duplicate protection only — not
+   backend exactly-once, a restart clears it and a browser can still double-add);
+5. fresh owner-bound **pre-read** (`customerCart`);
+6. validate against that pre-read, then dispatch **exactly ONE** mutation;
+7. fresh owner-bound **post-read**, which is the only authority for the verdict;
+8. report `applied` | `rejected` | `unknown`. Never retried, never compensated.
+
+| Tool | Arguments | Returns |
+| --- | --- | --- |
+| `mm_add_to_cart` | `sku`, `quantity` (> 0, fractional allowed), `confirm: true` | `{ verdict, mutation_count, intent, layout, quantity_observed, pre_state, post_state, cart_change_detected, errors, cart_id, price_status, next_step, observed_at }` |
+| `mm_update_cart_item` | `item_uid`, `quantity` (> 0, fractional allowed), `confirm: true` | `{ verdict, mutation_count, intent, quantity_requested, quantity_pre, quantity_observed, matches_absolute, matches_delta, pre_state, post_state, cart_change_detected, errors, cart_id, price_status, next_step, observed_at }` |
+| `mm_remove_cart_item` | `item_uid`, `confirm: true` | `{ verdict, mutation_count, intent, uid_present_post, pre_state, post_state, cart_change_detected, errors, cart_id, price_status, next_step, observed_at }` |
+
+Things to read carefully in those shapes:
+
+- There is **no cart id argument**. `cart_id` is *returned* as the fixed string
+  `not exposed (owner-bound, resolved internally)`: the cart comes from the authenticated
+  owner lookup, and a caller-supplied `cart_id`/`cartId` is refused `INVALID_ARGS`, never
+  forwarded and never silently ignored.
+- `verdict` has exactly three values, and the rule is deliberate:
+  - `applied` — the backend complained about nothing **and** the post-read is consistent
+    with the intent. Even then it means *consistent with*, not *caused by*: another client
+    may have made the same change.
+  - `rejected` — the backend errored **and** the observed cart is unchanged. Only a refusal
+    the state corroborates is called a refusal.
+  - `unknown` — everything else: a lost or timed-out answer, a clean answer with an
+    unchanged cart, and errors **with** a changed cart. Errors plus movement cannot prove
+    this intent failed (a partial landing — some units in, the rest refused — is a realistic
+    answer), so that combination is `unknown`, never `rejected` and never a coined
+    `applied_with_warnings`.
+  `unknown` means the write may already have applied; this server never retries, because a
+  retry of an unknown add is a possible double add.
+- `mutation_count` is 0 for anything refused before dispatch and exactly 1 once dispatched.
+- `updateCartItems` takes `cart_item_uid`, never `cart_item_id` (the wire documents copied
+  verbatim into `src/cart.mjs` use the uid form; `cart_item_id` appears in no record).
+- `matches_absolute` / `matches_delta` report which interpretation the observed quantity
+  matches. Absolute-vs-delta is **UNVERIFIED**: the number is passed through unchanged, and
+  if the post-read matches neither, the verdict is `unknown`.
+- `layout` says `new_line (sku absent from pre)` or `same_or_merged (pre already had the
+  sku)` — merge-vs-new-line is **UNVERIFIED**, so it is reported as observed, never predicted.
+- Quantities may be fractional (goods sold by weight) and are passed through exactly: 1.5
+  and 2.25 arrive as 1.5 and 2.25, never rounded or truncated. Quantity 0 is refused —
+  removal is explicit (`mm_remove_cart_item`), never implied by a zero.
+- No quantity constraint is invented or enforced here: step / min / max
+  (`mm_qty_step`, `unit_ecom`, `mis_stock`) are UNVERIFIED, so an out-of-step or
+  out-of-stock add is reported by backend errors, not predicted.
+- `pre_state` / `post_state` are `{ observed_at, line_count, total_quantity, grand_total_vnd,
+  lines }`; `line_count` counts rows and is never a quantity, `total_quantity` is upstream's
+  own figure. Totals are copied, never recomputed (`price_status`).
+- Address binding is still open: no `customer_address_id` / `city_code` / `ward_code` is
+  available, so a write never claims which address it priced against.
+- Wall clock: one write is three sequential requests (pre-read, mutation, post-read), each
+  with its own 25 s deadline, so `mm_add_to_cart` can take up to roughly 75 s. A wrapper
+  timeout of 30 s is too short; the live gate waits `CART_MUTATION_TIMEOUT` = 80 s for the
+  write call and keeps 30 s for every other call (see [testing.md](testing.md)).
+
 ## Application-level error codes
 
 | Code | From | Meaning |
 | --- | --- | --- |
 | `MISSING_STORE_ENV` | catalog | `MM_STORE_CODE` unset or empty; guest tools refuse to guess a store |
 | `INVALID_STORE_CODE` | catalog | `MM_STORE_CODE` present but not `b2c_<1–8 digits>_vi` |
-| `INVALID_ARGS` | catalog, account | bad or unknown argument for the tool |
-| `UNKNOWN_TOOL` | catalog, account | tool name this module does not implement |
+| `INVALID_ARGS` | catalog, account, cart | bad or unknown argument for the tool |
+| `UNKNOWN_TOOL` | catalog, account, cart | tool name this module does not implement |
 | `PRODUCT_NOT_FOUND` | catalog | no product for that exact `url_key` (or the answer's slug is not the one requested and no `expected_sku` was given) |
 | `MULTIPLE_PRODUCTS` | catalog | an exact `url_key` answered with more than one product |
 | `SKU_MISMATCH` | catalog | `expected_sku` does not equal the single answer's SKU |
 | `ENRICHMENT_INCOMPLETE` | catalog | a SKU on the CARD page was not priced, was priced twice, or an unrequested SKU was priced |
 | `PRICE_INVALID` | catalog | malformed money cell, or final price above regular price |
-| `BAD_MONEY` | account | cart money cell is not non-negative finite VND |
+| `BAD_MONEY` | account, cart | cart money cell is not non-negative finite VND |
 | `STORE_MISMATCH` | account | `storeConfig.store_code` disagrees with the store in the auth file |
 | `REQUIRES_LOGIN` | account | credential missing/unreadable/insecure/invalid/expired, cart not found, or upstream answered an authentication-category error — the one code to act on |
-| `BAD_UPSTREAM_DATA` | catalog, account | a required field was missing, malformed, duplicated or out of range |
-| `UPSTREAM_TIMEOUT` | catalog, account | the 25 s per-request deadline fired |
-| `UPSTREAM_UNREACHABLE` | catalog, account | DNS/connect/TLS failure |
-| `UPSTREAM_HTTP_STATUS` | catalog, account | a non-2xx status that is not 401/403 (those are `REQUIRES_LOGIN` in the account module) |
-| `RESPONSE_TOO_LARGE` | catalog, account | declared or streamed body crossed 2 MiB |
-| `RESPONSE_NOT_JSON` | catalog, account | body was not parseable JSON or had no `data` object |
-| `GRAPHQL_ERRORS` | catalog, account | the answer carried GraphQL errors that were not authentication errors |
-| `INTERNAL` | catalog, account | an unrecognised failure; no detail is ever leaked |
+| `BAD_UPSTREAM_DATA` | catalog, account, cart | a required field was missing, malformed, duplicated or out of range |
+| `UPSTREAM_TIMEOUT` | catalog, account, cart | the 25 s per-request deadline fired |
+| `UPSTREAM_UNREACHABLE` | catalog, account, cart | DNS/connect/TLS failure |
+| `UPSTREAM_HTTP_STATUS` | catalog, account, cart | a non-2xx status that is not 401/403 (those are `REQUIRES_LOGIN` in the account module) |
+| `RESPONSE_TOO_LARGE` | catalog, account, cart | declared or streamed body crossed 2 MiB |
+| `RESPONSE_NOT_JSON` | catalog, account, cart | body was not parseable JSON or had no `data` object |
+| `GRAPHQL_ERRORS` | catalog, account, cart | the answer carried GraphQL errors that were not authentication errors |
+| `INTERNAL` | catalog, account, cart | an unrecognised failure; no detail is ever leaked |
+| `CONFIRM_REQUIRED` | cart | `confirm` was not supplied at all: nothing was dispatched (the only code on a no-`confirm` call) |
+| `NOT_CONFIRMED` | cart | `confirm` was supplied but is not exactly `true`: nothing was dispatched |
+| `INTENT_IN_FLIGHT` | cart | an identical write is already being handled in this process: the second call dispatched nothing and did not wait for the first |
+| `GUARD_FULL` | cart | all 64 intent-guard slots are in flight: the call dispatched nothing rather than running unguarded (local cap, in-process only) |
+| `NOT_IN_CART` | cart | `item_uid` was not in the pre-read cart: nothing was dispatched, the current counts are named |
 
 ## Operator CLI outcomes (`scripts/auth-setup.mjs`)
 

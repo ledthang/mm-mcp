@@ -1,6 +1,16 @@
 # Cart-write contract discovery — 2026-10-31 (rev 2)
 
-**Verdict: SOURCE-VERIFIED, LIVE UNVERIFIED. No implementation and no live write authorized.**
+**Verdict: SOURCE-VERIFIED, LIVE UNVERIFIED. Live write not authorized.**
+
+> Update 2026-11-01: the split below has been built — `src/cart.mjs` (three confirm-gated
+> tools, wired in `src/server.mjs`, tested offline by `scripts/cart.test.mjs`, 28 checks)
+> and `scripts/cart-live.mjs` (the gated live runner). The gate has been executed **once**,
+> with approval: its pre-read answered `Syntax Error: Expected Name, found <EOF>` — one
+> missing brace in `CART_SNAPSHOT_QUERY` — so **zero mutations were dispatched** and no cart
+> changed. The query is fixed, and `npm run proof:cart` now shows both cart read documents
+> parse on the live site (anonymous, 3/3, one negative control). That changes the
+> implementation status only: no cart write has reached the live endpoint from this
+> repository, so every gate below remains OPEN and nothing here authorizes a write.
 
 Rev 1 of this document said add/update GraphQL documents were **missing**. That was wrong and is corrected here. The verified extractor output `/tmp/mm-cart-operations-<random>/mm-cart-operations.json` (a fresh private directory per run, dir mode `0700`, file mode `0600`; the old predictable path `/tmp/mm-cart-operations.json` is never written) (`scripts/cart_contract_extract.py`, run: `SELFCHECK OK`, `decode_failures: 0`) holds **13 records = 5 distinct operation texts** across 4 public chunks:
 
@@ -332,9 +342,25 @@ After timeout, connection loss, malformed response, or GraphQL partial failure t
 - **Update:** a matching desired quantity only becomes meaningful after absolute-vs-delta semantics are verified live. Configurable remove/re-add can be partly applied; never replay either leg automatically.
 - If the read fails, the cart changed, concurrent edits appear, duplicates exist, or attribution is uncertain: retain unknown/conflict, report fresh observed state, require explicit resolution. Unchanged reads do not prove a timed-out request cannot commit later. No retry/backoff middleware may resend mutations. Bound reconciliation reads; exhausted reads stay unknown.
 
+## Composite ceiling for one write (harness sizing)
+
+One cart write is **three sequential requests** inside a single `tools/call`: pre-read
+(25 s deadline) → exactly one mutation (25 s) → post-read (25 s), so the legitimate ceiling
+for one call is **≈75 s**. Any wrapper that waits less cannot see a slow-but-valid write
+finish. The bundled harness therefore names `CART_MUTATION_TIMEOUT` = 80 s for the write call
+(75 s + 5 s slack) and keeps the 30 s default for every other call; `ask()` validates a
+named bound to 1…`MAX_CALL_TIMEOUT` (90 s) and falls back to the default when it is absent or
+invalid, so no wait in the harness is unbounded. A write whose answer is lost — harness
+timeout, dead child, unparseable frame — is reported **unknown** with `mutation_count: 1`
+(the dispatch happened, the outcome is not known), never as a definite rejection, and is never
+re-issued. Only the post-read shows observed state; only an operator run of
+`npm run live:cart` turns any of this into live evidence.
+
 ## Minimal future split and fake-test gate
 
-**Design only; no files proposed for immediate creation.**
+**Design only; no files proposed for immediate creation.** Built 2026-11-01 as
+`src/cart.mjs` + `scripts/cart.test.mjs` + `scripts/cart-live.mjs`; the acceptance rows
+below are what the fakes cover, and every row is still fake evidence, not a live write.
 
 1. **Server cart adapter:** trusted owner/cart resolver (`customerCart.id` server-side; no caller cart-id), exact document allowlist limited to the five texts above, input/subtype/quantity checks, intent guard, one mutation dispatch, owner-bound reconciliation. Existing session/transport primitives only; no new dependency.
 2. **Intent/UI layer:** explicit add/update/remove intent with expected pre-state and confirmation; pending/unknown/conflict display; no direct credentials or cart IDs; no retries; no optimistic success. Pure fake fixtures alongside the adapter using existing Node assertion tooling.
@@ -365,8 +391,17 @@ Fake acceptance must pass before any separately authorized live write; none has 
 5. Authoritative quantity step/min/max (`mm_qty_step`, `unit_ecom`, `mis_stock`).
 6. Owner-bound bridge from `customerCart.id` to the `$cartId`-parameterised documents, with no caller-supplied id.
 7. Address binding verification (currently blocked: `customer_address_id`/`city_code`/`ward_code` missing, `is_new_administrative: false`).
-8. Deterministic fake suite passing.
+8. Deterministic fake suite passing — **met locally 2026-11-01** (`scripts/cart.test.mjs`
+   28/28 and `scripts/cart-live.test.mjs` 20/20 under `npm test`, against an injected fake
+   transport and FAKE children only; still not live evidence).
 9. Separate explicit approval plus an isolated, non-protected live fixture.
+
+**Live activity 2026-11-01:** the write gate (`npm run live:cart`) has been executed once with
+all four variables set; the tool's pre-read answered `Syntax Error: Expected Name, found
+<EOF>` (one missing brace in `CART_SNAPSHOT_QUERY`), so **zero mutations were dispatched** and
+no cart was touched. The brace is fixed and both cart read documents are now proven to parse on
+the live site (`npm run proof:cart`: 3/3, anonymous, includes a negative control). None of that
+closes gates 1–7 or 9: a parse is not a write, and no write has been confirmed.
 
 **This document verifies document text and offsets only — it does not verify the write contract
 end-to-end, and authorizes no implementation and no live experiment. No live cart was touched.**

@@ -13,8 +13,15 @@
 //      mm_get_delivery_context -> mm_list_addresses -> mm_get_cart -> mm_cart_summary.
 //
 // Lifetime bounds, one child at a time:
-//   - one request -> at most one reply; CALL_TIMEOUT (30 s) covers a hung answer
-//     (the server itself caps one upstream call at 25 s);
+//   - one request -> at most one reply; ask(id, method, params[, timeoutMs]) waits
+//     CALL_TIMEOUT (30 s) unless the caller names a longer one; the hard ceiling is
+//     MAX_CALL_TIMEOUT (90 s). A per-call timeout is a BOUND, never an open-ended wait,
+//     and only a caller that must have it raises above CALL_TIMEOUT — today that is
+//     scripts/cart-live.mjs, whose write call wraps three sequential upstream requests
+//     (pre-read + one mutation + post-read, 25 s each = a ~75 s composite ceiling), which
+//     is CART_MUTATION_TIMEOUT (80 s). Every other call, read or init, keeps 30 s.
+//     A timed-out WRITE is reported UNKNOWN by that gate (the write may already have
+//     committed), never as a definite rejection, and is never re-issued;
 //   - retained stdout is capped at MAX_LINE_BYTES (2 MiB per pending line) — over the
 //     cap the session answers LOCAL_LIMIT and the child is SIGKILLed (documented:
 //     any legitimate envelope here is far below 2 MiB);
@@ -46,6 +53,8 @@ import { fileURLToPath } from "node:url";
 const SERVER = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "server.mjs");
 const PV = "2024-11-05";
 const CALL_TIMEOUT = 30000; // one request -> one envelope; server caps one upstream call at 25 s
+const MAX_CALL_TIMEOUT = 90000; // hard ceiling for any per-call wait a caller may name
+const CART_MUTATION_TIMEOUT = 80000; // pre-read + one mutation + post-read = ~75 s ceiling, +5 s slack
 const MAX_LINE_BYTES = 2 * 1024 * 1024; // retained stdout cap per pending line (2 MiB, documented)
 const CLOSE_GRACE = 5000;
 const URL_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
@@ -93,7 +102,10 @@ function check(id, facts) { // facts(): throws => FAIL line; returns safe object
 // One child session on stdio. cmd is fixed by the caller (no env override of the
 // executable). ask() = one strict JSON-RPC request, reply matched by exact id;
 // notify() owes no reply. Frames reaching a session with no live waiter are counted
-// as orphans (visible in facts, never silent). All timing waits are bounded above.
+// as orphans (visible in facts, never silent). All timing waits are bounded above:
+// ask/call take an optional per-call timeoutMs, validated to 1..MAX_CALL_TIMEOUT and
+// falling back to CALL_TIMEOUT when absent or invalid — a bad timeout is never
+// "wait forever", and no wait in this harness is unbounded.
 function spawnGate(env, cmd) {
   const st = { spawnedAt: Date.now(), dead: null, stderrClean: true, cur: null, orphans: 0, closed: null, childClosed: false, exitCode: null, exitSignal: null };
   const c = spawn(cmd[0], cmd.slice(1), { stdio: ["pipe", "pipe", "pipe"], env });
@@ -139,11 +151,16 @@ function spawnGate(env, cmd) {
     }
   });
 
-  st.ask = (id, method, params) => {
+  st.ask = (id, method, params, timeoutMs) => {
     if (st.dead) return Promise.resolve({ dead: st.dead });
+    // per-call bound: validated here, never unbounded; only a caller that must have it
+    // (a cart write: pre-read + one mutation + post-read = ~75 s) passes over CALL_TIMEOUT
+    const ms = Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= MAX_CALL_TIMEOUT
+      ? timeoutMs
+      : CALL_TIMEOUT;
     return new Promise((resolve) => {
       const w = { resolve, timer: null };
-      w.timer = setTimeout(() => { if (st.cur === w) { st.cur = null; resolve({ timeout: true }); } }, CALL_TIMEOUT);
+      w.timer = setTimeout(() => { if (st.cur === w) { st.cur = null; resolve({ timeout: true }); } }, ms);
       st.cur = w;
       c.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, ...(params !== undefined ? { params } : {}) }) + "\n");
     });
@@ -160,9 +177,11 @@ function spawnGate(env, cmd) {
     if ("error" in fr && !(isObj(fr.error) && Number.isInteger(fr.error.code) && typeof fr.error.message === "string")) return { ok: false, why: "error shape" };
     return { ok: true, fr };
   };
-  // tools/call: strict envelope + exactly one non-empty text block.
-  st.call = (id, name, args) =>
-    st.ask(id, "tools/call", { name, arguments: args }).then((fr) => {
+  // tools/call: strict envelope + exactly one non-empty text block. timeoutMs is the
+  // per-call bound (default CALL_TIMEOUT); a cart write caller must raise it, because
+  // that one tool call wraps pre-read + one mutation + post-read (~75 s ceiling).
+  st.call = (id, name, args, timeoutMs) =>
+    st.ask(id, "tools/call", { name, arguments: args }, timeoutMs).then((fr) => {
       const s = st.strict(fr, id);
       if (!s.ok) return s;
       const res = s.fr.result;
@@ -265,7 +284,7 @@ async function main() {
       const p = JSON.parse(rs.text);
       assert.ok(Array.isArray(p.products), "products array");
       assert.ok(p.products.length > 0 && p.products.length <= 10, "nonempty page within the requested page size");
-      assert.ok(p.products.every((r) => Number.isSafeInteger(r.id) && r.id > 0 && typeof r.sku === "string" && r.sku !== "" && typeof r.name === "string" && r.name !== "" && typeof r.unit === "string" && r.unit !== "" && typeof r.stock_status === "string" && Number.isSafeInteger(r.quantity_step) && r.quantity_step >= 1 && vndRow(r)), "every row complete + valid VND");
+      assert.ok(p.products.every((r) => Number.isSafeInteger(r.id) && r.id > 0 && typeof r.sku === "string" && r.sku !== "" && typeof r.name === "string" && r.name !== "" && (r.unit === null || (typeof r.unit === "string" && r.unit !== "")) && typeof r.stock_status === "string" && Number.isFinite(r.quantity_step) && r.quantity_step > 0 && vndRow(r)), "every row complete + valid VND (unit may be null, step may be fractional)");
       const skus = p.products.map((r) => r.sku);
       assert.equal(new Set(skus).size, skus.length, "no duplicate sku on the page");
       assert.ok(p.products.every((r) => typeof r.url_key === "string" && URL_KEY_RE.test(r.url_key)), "every search row carries a valid slug");
@@ -398,4 +417,4 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   });
 }
 
-export { spawnGate };
+export { spawnGate, CALL_TIMEOUT, MAX_CALL_TIMEOUT, CART_MUTATION_TIMEOUT };

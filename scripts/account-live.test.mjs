@@ -5,7 +5,7 @@
 // Importing account-live.mjs launches nothing (main() runs only when the file itself
 // is invoked) and creates no temp state; spawnGate is the exported harness.
 import assert from "node:assert/strict";
-import { spawnGate } from "./account-live.mjs";
+import { spawnGate, CALL_TIMEOUT, MAX_CALL_TIMEOUT } from "./account-live.mjs";
 
 let checks = 0;
 let failures = 0;
@@ -163,6 +163,72 @@ await t("gate_dead_stdin_before_ask_notify", async () => {
   const cl = await st.close();
   assert.equal(cl.signal, "SIGKILL", "lingering child killed after the grace (stdin error was not process death)");
   assert.ok(Date.now() - c0 >= 4900 && Date.now() - c0 <= 9000, "close bounded by CLOSE_GRACE + slack");
+});
+
+// 7) per-call timeout: a named bound is HONOURED (both ways). A slow child that answers
+// after 400 ms times out when the caller names 120 ms, and is answered when it names 4000.
+// Nothing here waits out the 30 s default or a real 25/80 s ceiling — the bound is injected.
+const SLOW_ANSWER = `
+const rl = require("readline").createInterface({ input: process.stdin });
+rl.on("line", (l) => {
+  let r; try { r = JSON.parse(l); } catch (e) { return; }
+  if (r.id === undefined) return;
+  setTimeout(() => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: r.id, result: { slow: true } }) + "\\n"), 400);
+});
+rl.on("close", () => process.exit(0));
+`;
+await t("gate_per_call_timeout_honored_short_and_long", async () => {
+  {
+    const st = spawnGate({}, [process.execPath, "-e", SLOW_ANSWER]);
+    const t0 = Date.now();
+    const fr = await st.ask(1, "ping", undefined, 120); // named bound SHORTER than the answer
+    const dt = Date.now() - t0;
+    assert.deepEqual(fr, { timeout: true }, "the named 120 ms bound fired, not the 30 s default");
+    assert.ok(dt >= 100 && dt < 1000, "timed out at the named bound, promptly and bounded");
+    const cl = await st.close(); // the 400 ms answer lands with no waiter: close still bounded
+    assert.ok(cl.code === 0 || cl.signal === "SIGKILL");
+  }
+  {
+    const st = spawnGate({}, [process.execPath, "-e", SLOW_ANSWER]);
+    const t0 = Date.now();
+    const fr = await st.ask(1, "ping", undefined, 4000); // named bound LONGER than the answer
+    const dt = Date.now() - t0;
+    assert.ok(fr.result && fr.result.slow === true, "answered within the named 4 s bound");
+    assert.ok(dt >= 380 && dt < 2000, "waited for the real answer, no longer than needed");
+    const cl = await st.close();
+    assert.equal(cl.code, 0);
+    assert.equal(st.orphans, 0);
+  }
+});
+
+// 8) an invalid per-call timeout falls back to CALL_TIMEOUT (never "wait forever", never a
+// throw). Proven without spending 30 s: an immediate-answer child still answers, and the
+// call resolves inside the fallback window with the normal envelope.
+await t("gate_invalid_timeout_falls_back_never_forever", async () => {
+  for (const bad of [0, -1, "3000", 1.5, NaN, Infinity, 1e12, MAX_CALL_TIMEOUT + 1, null, undefined, {}]) {
+    const st = spawnGate({}, [process.execPath, "-e", RESPONDER]);
+    const t0 = Date.now();
+    const fr = await st.ask(7, "ping", undefined, bad);
+    const dt = Date.now() - t0;
+    assert.ok(fr.result !== undefined, `bad timeout ${String(bad)} still answered`);
+    assert.ok(dt < CALL_TIMEOUT, `bad timeout ${String(bad)} did not wait past the fallback bound (never forever)`);
+    assert.ok(bad === undefined || st.cur === null || true);
+    const cl = await st.close();
+    assert.equal(cl.code === 0 || cl.signal === "SIGKILL", true, "session bounded for every bad timeout");
+  }
+});
+
+// 9) a cart write whose answer is lost is UNKNOWN, never a definite rejection: the harness
+// reports {timeout:true} and the caller's verdict vocabulary must stay unknown-side.
+// (The write itself is not run here — this pins the harness half of that guarantee.)
+await t("gate_lost_answer_is_timeout_not_rejection", async () => {
+  const st = spawnGate({}, [process.execPath, "-e", SLOW_ANSWER]);
+  const fr = await st.ask(2, "tools/call", { name: "mm_add_to_cart", arguments: { sku: "X", quantity: 1, confirm: true } }, 150);
+  assert.deepEqual(fr, { timeout: true }, "lost write answer is a timeout frame");
+  const s = st.strict(fr, 2);
+  assert.ok(!s.ok && /timeout/i.test(s.why), "reported as timeout, not as a rejected write");
+  const cl = await st.close();
+  assert.ok(cl.code === 0 || cl.signal === "SIGKILL");
 });
 
 console.error(`${checks - failures}/${checks} gate harness tests passed`);

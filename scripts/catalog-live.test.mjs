@@ -30,7 +30,7 @@ const FAKE_OK = `
 const rl = require("readline").createInterface({ input: process.stdin });
 const store = process.env.MM_STORE_CODE;
 const PS = [10, 20, 24, 50];
-const NAMES = ["mm_search_products","mm_get_product","mm_auth_status","mm_get_delivery_context","mm_list_addresses","mm_get_cart","mm_cart_summary"];
+const NAMES = ["mm_search_products","mm_get_product","mm_auth_status","mm_get_delivery_context","mm_list_addresses","mm_get_cart","mm_cart_summary","mm_add_to_cart","mm_update_cart_item","mm_remove_cart_item"];
 const TOOL_DESC = "live gate fake tool description long enough to pass the shape check";
 function send(o) { process.stdout.write(JSON.stringify(o) + "\\n"); }
 function ok(id, result) { send({ jsonrpc: "2.0", id, result }); }
@@ -40,10 +40,14 @@ function callErr(id, code) { ok(id, { content: [{ type: "text", text: code + " s
 const TOTAL = 32;
 function row(i) {
   const reg = 20000 + (i % 7) * 1500;
-  const fin = reg - (i % 3) * 500;
+  // final > regular is REAL upstream data (SKU351030_23510302: final 55000 / regular 52000 /
+  // discount 0), so the faithful fake serves inverted rows too: the gate must accept them.
+  const fin = i % 6 === 0 ? reg + 3000 : reg - (i % 3) * 500;
   return {
     id: 9000 + i, sku: "SKU" + (1000 + i), name: "San pham " + i, url_key: "san-pham-" + i,
-    unit: i % 2 ? "Hop" : "Kg", stock_status: "IN_STOCK",
+    // unit_ecom is nullable upstream (null on 7 of 11 real "ức gà" cards): null is a valid answer
+    unit: i % 3 === 0 ? null : (i % 2 ? "Hop" : "Kg"),
+    stock_status: "IN_STOCK",
     quantity_step: i % 4 === 0 ? 0.5 : 1, // fractional step is legitimate
     price_vnd: fin, regular_price_vnd: reg, promotion: null, member_offer: null,
   };
@@ -127,7 +131,7 @@ await t("gate passes end-to-end against a faithful fake server", async () => {
   const r = await gateOn(FAKE_OK);
   assert.deepEqual(failed(r), [], "all checks pass");
   assert.deepEqual(r.checks.map((c) => c.id), ALL_IDS);
-  assert.equal(r.checks.find((c) => c.id === "G.tools_list_exact").facts.count, 7, "all 7 published tools, not a stale single-tool bar");
+  assert.equal(r.checks.find((c) => c.id === "G.tools_list_exact").facts.count, 10, "all 10 published tools, not a stale single-tool bar");
   const search = r.checks.find((c) => c.id === "G.search_page0");
   assert.equal(search.facts.rows, 24);
   assert.equal(search.facts.total_count, 32);
@@ -160,9 +164,56 @@ await t("authenticated context on a guest call is caught", async () => {
   const r = await gateOn(FAKE_OK.replace(/authenticated: false/g, "authenticated: true"));
   assert.ok(failed(r).includes("G.search_page0"));
 });
-await t("price inversion (final above regular) is caught", async () => {
-  const r = await gateOn(FAKE_OK.replace("price_vnd: fin, regular_price_vnd: reg", "price_vnd: reg + 100, regular_price_vnd: reg"));
+// --- price contract: cells are copied as observed, final > regular is not a defect ------
+await t("final above regular is upstream data: the gate accepts it (no invented discount)", async () => {
+  const r = await gateOn(FAKE_OK.replace("const fin = i % 6 === 0 ? reg + 3000 : reg - (i % 3) * 500;", "const fin = reg + 100;"));
+  assert.deepEqual(failed(r), [], "every row priced above regular must still pass");
+  const seen = r.checks.find((c) => c.id === "G.search_page0").facts.observed;
+  const inv = seen.filter((s) => { const m = s.match(/ (\d+)\/(\d+)$/); return m && Number(m[1]) > Number(m[2]); });
+  assert.equal(inv.length, 24, "all 24 rows are final>regular and are reported as observed");
+});
+await t("faithful fake (mixed equal / discounted / inverted rows) passes end-to-end", async () => {
+  const r = await gateOn(FAKE_OK);
+  assert.deepEqual(failed(r), [], "no final<=regular invariant survives in the gate");
+  const facts = r.checks.find((c) => c.id === "G.search_page0").facts;
+  assert.ok(facts.observed.some((s) => { const m = s.match(/ (\d+)\/(\d+)$/); return m && Number(m[1]) > Number(m[2]); }), "an inverted pair is present and passed");
+  assert.ok(facts.observed.some((s) => { const m = s.match(/ (\d+)\/(\d+)$/); return m && m[1] === m[2]; }), "an equal pair is present and passed");
+});
+await t("negative price_vnd is caught", async () => {
+  const r = await gateOn(FAKE_OK.replace("price_vnd: fin, regular_price_vnd: reg", "price_vnd: -fin, regular_price_vnd: reg"));
   assert.ok(failed(r).includes("G.search_page0"));
+});
+await t("negative regular_price_vnd is caught", async () => {
+  const r = await gateOn(FAKE_OK.replace("price_vnd: fin, regular_price_vnd: reg", "price_vnd: fin, regular_price_vnd: -reg"));
+  assert.ok(failed(r).includes("G.search_page0"));
+});
+await t("fractional price is caught (VND has no minor unit)", async () => {
+  const r = await gateOn(FAKE_OK.replace("price_vnd: fin, regular_price_vnd: reg", "price_vnd: fin + 0.5, regular_price_vnd: reg"));
+  assert.ok(failed(r).includes("G.search_page0"), "52000.5 VND is malformed, not a price");
+});
+await t("currency-string price is caught (price_vnd must be a number)", async () => {
+  const r = await gateOn(FAKE_OK.replace("price_vnd: fin, regular_price_vnd: reg", "price_vnd: 'VND' + fin, regular_price_vnd: reg"));
+  assert.ok(failed(r).includes("G.search_page0"));
+  assert.ok(failed(r).includes("G.detail_from_search"), "the same malformed contract must fail detail too");
+});
+await t("null unit on a row is a valid answer (upstream nullable)", async () => {
+  const r = await gateOn(FAKE_OK.replace('unit: i % 3 === 0 ? null : (i % 2 ? "Hop" : "Kg")', "unit: null"));
+  assert.deepEqual(failed(r), [], "unit null is what upstream says: it must not fail the gate");
+  assert.equal(r.checks.find((c) => c.id === "G.search_page0").facts.units_null, 24, "all 24 units null, all passed");
+});
+await t("empty-string unit is caught", async () => {
+  const r = await gateOn(FAKE_OK.replace('unit: i % 3 === 0 ? null : (i % 2 ? "Hop" : "Kg")', 'unit: ""'));
+  assert.ok(failed(r).includes("G.search_page0"));
+});
+await t("non-string unit (a number) is caught", async () => {
+  const r = await gateOn(FAKE_OK.replace('unit: i % 3 === 0 ? null : (i % 2 ? "Hop" : "Kg")', "unit: 5"));
+  assert.ok(failed(r).includes("G.search_page0"));
+});
+await t("detail answering with a null unit is valid, an empty-string unit is caught", async () => {
+  const okNull = await gateOn(FAKE_OK);
+  assert.deepEqual(failed(okNull), [], "row 0 (the linked row) carries unit null and the detail check passes");
+  const r = await gateOn(FAKE_OK.replace('unit: i % 3 === 0 ? null : (i % 2 ? "Hop" : "Kg")', 'unit: i === 0 ? "" : "Kg"'));
+  assert.ok(failed(r).includes("G.detail_from_search"), "detail unit '' is malformed");
 });
 await t("fractional quantity_step is accepted (0.5 is legitimate ordering)", async () => {
   const r = await gateOn(FAKE_OK.replace("quantity_step: i % 4 === 0 ? 0.5 : 1", "quantity_step: 0.5"));

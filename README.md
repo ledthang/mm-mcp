@@ -1,9 +1,11 @@
 # mm-mcp
 
-Minimal Model Context Protocol (MCP) server for MM Mega Market Vietnam: seven tools over
+Minimal Model Context Protocol (MCP) server for MM Mega Market Vietnam: ten tools over
 newline-delimited JSON-RPC 2.0 on stdio — two guest catalog reads, five authenticated
-account reads. Protocol version `2024-11-05`, held as a constant in `src/server.mjs`. No
-MCP SDK in the project: nothing to install, nothing to migrate.
+account reads, three authenticated cart writes (confirm-gated, and **not live-verified**:
+no cart write has ever been sent from this repository). Protocol version `2024-11-05`,
+held as a constant in `src/server.mjs`. No MCP SDK in the project: nothing to install,
+nothing to migrate.
 
 Audit findings and prioritized follow-up: [MCP audit](docs/mcp-audit.md).
 
@@ -27,31 +29,47 @@ still refused.
 - **Covered by tests:** `scripts/stdio.test.mjs` (initialize / ping / list / call, valid and
   invalid metadata, strict arguments, fractional and `Infinity` ids, fatal UTF-8 with
   recovery). Verified 2026-11-01: `npm test` under synthetic `HOME`/`XDG` =
-  **212 pass, 2 live-only SKIP**, exit 0 (74 auth + 37 stdio + 42 catalog +
-  33 account + 6 harness + 20 catalog live-runner). Separately, `node scripts/consumer-acceptance.mjs` on a
+  **255 pass, 2 live-only SKIP**, exit 0 (74 auth + 37 stdio + 42 catalog +
+  33 account + 9 harness + 20 catalog live-runner + 27 cart + 13 cart write gate vs fake
+  children). Separately, `node scripts/consumer-acceptance.mjs` on a
   loopback fixture: 30 checks, `fixture: true`.
 - **SDK handshake exercised (2026-11-01):** MCP Python SDK 2.0.0 in the Hermes venv ran
   `initialize` / `tools/list` / `tools/call` against this server — **PASS**, protocol
   `2024-11-05`, 7 tools, no upstream calls
   (`~/.hermes/hermes-agent/venv/bin/python -B ~/.hermes/workspace/mm-sdk-check.py`).
+  That run listed 7 tools: the three cart write tools were added afterwards and the SDK run
+  has **not** been repeated, so the cart tools have no SDK evidence.
   `python3 -m pip show mcp` printing `WARNING: Package(s) not found: mcp` describes the
   system interpreter only and says nothing about that venv. The SDK is client-side: this
   repository still ships zero npm dependencies.
 - **Not certified:** the configured Hermes session was never opened, so Hermes end to end is
   unproven. The old "Hermes fails to connect" note predates this fix; the SDK PASS above is
   SDK evidence with no Hermes configuration loaded, not a Hermes run.
-- **Unchanged:** seven read tools, no cart writes, stdio only.
+- **Changed this pass:** three cart write tools added (`src/cart.mjs`, wired in
+  `src/server.mjs`), so the surface is now ten tools. They are confirm-gated and proven only
+  by offline fakes; stdio only, still zero dependencies.
 
 ## Scope of "read only"
 
-- The seven MCP tools are reads: no cart, address, session or cache mutation is reachable
-  from a tool call.
+- Seven of the ten MCP tools are reads. The other three (`mm_add_to_cart`,
+  `mm_update_cart_item`, `mm_remove_cart_item`) do write to the owner's cart, and only when
+  called with `confirm: true`; no address, session or cache mutation is reachable from a
+  tool call, and there is still no checkout or order tool.
+- The three cart writes are **not live-verified**: they are implemented and covered by
+  offline fakes (`scripts/cart.test.mjs`), and no add/update/remove has ever reached the
+  real endpoint from this repository. `npm run live:cart` is the gated runner that would
+  produce that evidence; it refuses to run without an explicit approval. It has been run
+  **once**, with approval (2026-11-01): the tool's own pre-read failed with a GraphQL
+  `Syntax Error` (one missing brace in `CART_SNAPSHOT_QUERY`), so **zero mutations were
+  dispatched** and nothing was added. The query is fixed, and `npm run proof:cart` proves
+  both cart read documents parse on the live site (anonymous, 3/3). A verified write still
+  requires another gated run.
 - The repository has one other path, and it does write: `scripts/auth-setup.mjs` is an
   operator CLI, run by a human in a terminal, that sends one `SignIn` mutation upstream and
   writes the credential file locally. It is not an MCP tool, so a client cannot invoke it;
   calling it "read-only" would be wrong — it issues a token.
 
-## The seven tools
+## The ten tools
 
 | Tool | Context | Arguments | What you get |
 | --- | --- | --- | --- |
@@ -62,9 +80,14 @@ still refused.
 | `mm_list_addresses` | authenticated | `page_index?`, `page_size?` | saved address-book rows |
 | `mm_get_cart` | authenticated | none | your cart, line by line |
 | `mm_cart_summary` | authenticated | none | counts and totals only |
+| `mm_add_to_cart` | authenticated, **write** | `sku`, `quantity`, `confirm: true` | one add, then the observed cart |
+| `mm_update_cart_item` | authenticated, **write** | `item_uid`, `quantity`, `confirm: true` | one line's quantity changed, then observed |
+| `mm_remove_cart_item` | authenticated, **write** | `item_uid`, `confirm: true` | one line removed, then observed |
 
 Guest tools need no credential. Authenticated tools read the credential from a file and
-prove it live on every call — no cached success, no login tool.
+prove it live on every call — no cached success, no login tool. The three write tools take no
+cart id either: the cart is the authenticated owner's, resolved on every call (see
+[docs/tools-reference.md](docs/tools-reference.md) for their sequences and verdict meanings).
 
 ## Requirements
 
@@ -76,16 +99,22 @@ dependencies, no install step, no build.
 ## Response times
 
 Each upstream request has a 25 s deadline (`TIMEOUT_MS` in `src/catalog.mjs` and
-`src/account.mjs`). `mm_search_products` issues **two sequential** requests — `ProductSearch`
+`src/account.mjs`, `POST_TIMEOUT_MS` in `src/cart.mjs` — the cart adapter POSTs, it never
+sends a mutation as GET). `mm_search_products` issues **two sequential** requests — `ProductSearch`
 (CARD), then `ProductSearchEnrich` (ENRICH) — each with its own 25 s deadline, so one valid
-search can take up to roughly 50 s wall clock. Every other tool issues one request, so
-25 s is its ceiling.
+search can take up to roughly 50 s wall clock. Each cart write tool issues **three**
+sequential requests (pre-read, one mutation, post-read), so one valid write can take up to
+roughly **75 s**. Every other tool issues one request, so 25 s is its ceiling.
 
 Consequence for anything wrapping the server: a caller-side timeout of 30 s is shorter than
-that ceiling and can time out a search that is still legitimately in flight. The bundled
-stdio harness uses exactly that 30 s (`CALL_TIMEOUT` in `scripts/account-live.mjs`, reused by
-`scripts/catalog-live.mjs`), so a slow-but-valid search can show up as a harness timeout
-rather than a server failure. Set wrapper/client timeouts above ~50 s for search, or accept
+those ceilings and can time out a search or a write that is still legitimately in flight. The
+bundled stdio harness (`spawnGate` in `scripts/account-live.mjs`, reused by
+`scripts/catalog-live.mjs` and `scripts/cart-live.mjs`) waits 30 s per request by default and
+takes an optional named per-call bound (validated to 1…90 s, falling back to 30 s — a bad
+timeout is never "wait forever"); the cart write gate names 80 s for its one write call so it
+can see a slow-but-valid write finish, and keeps 30 s everywhere else. A timed-out write is
+reported `unknown` (`mutation_count: 1`), never a definite rejection, and is never re-issued.
+Set wrapper/client timeouts above ~50 s for search and above ~75 s for a cart write, or accept
 the truncation as a harness limit.
 
 ## Configure an MCP client (illustrative, not certified)
@@ -141,11 +170,14 @@ code) and the exact request sequence.
 npm test
 ```
 
-Six suites. None reaches the real endpoint or any external network: the suites answer from
+Eight suites. None reaches the real endpoint or any external network: the suites answer from
 canned payloads and local child processes over real pipes. No credential needed. Verified
-2026-11-01: 212 pass, plus 2 anonymous live-parse checks that report `SKIP` because they
+2026-11-01: 255 pass, plus 2 anonymous live-parse checks that report `SKIP` because they
 only run under `MM_LIVE_PARSE=1` (`npm run live:parse`). Skipped checks are not passes.
-`scripts/` is the authoritative source for current counts.
+The cart suite's 28 checks and the cart write gate suite's 20 checks are all against fakes:
+`applied` there means "the fake answered consistently", not "the store accepted a write".
+`scripts/` is the authoritative source for
+current counts.
 
 `node scripts/consumer-acceptance.mjs` (not part of `npm test`) is also network-free in the
 "no real endpoint" sense, but it is not socket-free: it binds a real HTTP fixture on
@@ -157,9 +189,20 @@ Opt-in live gates, all separate from `npm test`:
 MM_STORE_CODE=b2c_NNNNN_vi npm run live              # guest catalog, real endpoint
 npm run live:parse                                   # do the shipped queries still PARSE? (anonymous)
 MM_STORE_CODE=b2c_NNNNN_vi npm run live:account    # real credential needed, operator-local
+MM_MCP_LIVE=1 MM_CART_WRITE_APPROVED=i_understand_this_changes_the_cart \
+  MM_LIVE_SKU=<exact sku> MM_LIVE_QTY=<n> npm run live:cart   # ONE real add, operator-approved
 node scripts/consumer-acceptance.mjs               # synthetic fixture, loopback, MCP over stdio
 node scripts/consumer-acceptance.mjs --live-readonly   # same walk, real store, real data
 ```
+
+`npm run live:cart` changes a real cart: it puts stock on your account and does not take it
+back out again (no automatic cleanup — a cleanup would be a second mutation you did not
+approve). Without all four variables it prints `{"status":"blocked", …}` and makes no
+request at all. It has been run once, on 2026-11-01: the pre-read failed with a GraphQL
+`Syntax Error` caused by one missing brace in `CART_SNAPSHOT_QUERY`, so **zero mutations
+were dispatched** and no cart changed. The query is fixed (brace balance is now a check in
+`scripts/cart.test.mjs`, and `npm run proof:cart` confirms it parses live); the write
+itself is still **not verified** — a clean gated run has to happen after the fix.
 
 ## Documentation
 
@@ -170,14 +213,19 @@ node scripts/consumer-acceptance.mjs --live-readonly   # same walk, real store, 
 | [docs/architecture.md](docs/architecture.md) | how the pieces fit, request flows, trust boundaries |
 | [docs/testing.md](docs/testing.md) | suites, live gates, what SKIP/PASS mean, troubleshooting |
 | [docs/auth-lifecycle-contract.md](docs/auth-lifecycle-contract.md) | evidence record for login, tokens, expiry |
-| [docs/cart-write-contract.md](docs/cart-write-contract.md) | cart-write research (not implemented) |
+| [docs/cart-write-contract.md](docs/cart-write-contract.md) | cart-write wire evidence; implemented offline, one gated live run blocked before dispatch (2026-11-01), **not live-verified** |
 | [docs/consumer-acceptance.md](docs/consumer-acceptance.md) | consumer-level acceptance run: fixture vs live |
 
 ## Limits, stated plainly
 
-- No cart, address, session or cache mutation is reachable from MCP: no `add`/`update`/
-  `remove` tool, no address-selection tool, no checkout, no order. The operator CLI writes
-  a local credential file and sends one `SignIn` mutation; that is the only write path.
+- Cart `add`/`update`/`remove` now exist as MCP tools, but none of them is live-verified:
+  they are proven only against offline fakes, and no cart write has ever reached the store
+  from this repository (the one gated run on 2026-11-01 was blocked by its own failing
+  pre-read and dispatched nothing). No address-selection tool, no checkout, no order. The
+  operator CLI (`npm run auth:setup`) still writes a local credential file and sends one
+  `SignIn` mutation.
+  mutation; `npm run live:cart` is the only runner that would send a real cart mutation, and
+  it requires explicit approval to do so.
 - The `_meta` params gap that used to block clients that send request metadata is closed in
   `src/server.mjs` and covered by `scripts/stdio.test.mjs`; no MCP client connection,
   Hermes included, is certified here.

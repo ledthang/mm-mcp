@@ -6,15 +6,32 @@ Audit of the shipped Node.js stdio server against its declared MCP `2024-11-05` 
 
 **Hermes interoperability was blocked by `_meta` — repaired locally 2026-11-01, Hermes session still uncertified.** Valid request metadata (`params._meta`) used to be rejected; an object `_meta` is now accepted on `initialize`, `ping`, `tools/list` and `tools/call` and then ignored. The MCP Python SDK used by Hermes reproduced the initialization failure before this fix (earlier audit run, an SDK build emitting `_meta: {}` on every method). After the fix, MCP Python SDK 2.0.0 installed in the Hermes venv was run against the shipped server: `~/.hermes/hermes-agent/venv/bin/python -B ~/.hermes/workspace/mm-sdk-check.py` → PASS, initialize / tools/list / tools/call all succeeded, negotiated `protocolVersion` `2024-11-05`, 7 tools discovered, no upstream calls made. `python3 -m pip show mcp` → `Package(s) not found: mcp` describes the system interpreter only and is irrelevant here — the SDK lives in the venv. The configured Hermes session was still not opened, so Hermes end to end remains uncertified; earlier public/account live gates exercised a hand-built client without this metadata, and their successful results did not establish Hermes compatibility.
 
-The published surface contains seven read tools. No add, update or remove-cart tool exists. Fixing metadata alone will not enable cart writes. This audit performed no real account/cart reads or writes, login, or credential inspection.
+The published surface contained seven read tools at audit time — no add, update or
+remove-cart tool existed, and fixing metadata alone would not enable cart writes. Later the
+same day (2026-11-01) three confirm-gated cart write tools were implemented
+(`src/cart.mjs`, wired in `src/server.mjs`), so the surface is ten; they are proven only by
+offline fakes and are not live-verified. This audit performed no real account/cart reads or
+writes, login, or credential inspection.
 
 ## Checks and evidence boundaries
 
-- Re-ran `npm test` under synthetic HOME/XDG after the repairs, 2026-11-01: exit 0, 212 offline checks passed (74 auth + 37 stdio + 42 catalog + 33 account + 6 harness + 20 catalog live runner), two live-only checks skipped. Before the added stdio regressions, the total was 199.
+- Re-ran `npm test` under synthetic HOME/XDG after the repairs, 2026-11-01: exit 0, offline
+  checks passed (74 auth + 37 stdio + 42 catalog + 33 account + 6 harness + 20 catalog live
+  runner), two live-only checks skipped. Before the added stdio regressions, the total was
+  199. After the cart-write follow-up later the same day the chain is eight suites:
+  **255 pass / 2 SKIP, exit 0** (the extra 27 are `scripts/cart.test.mjs`, 13
+  `scripts/cart-live.test.mjs`, both fake-only).
 - Exercised actual `node src/server.mjs` over stdio with synthetic environment: pre-fix, metadata requests failed and baseline initialize/list succeeded; post-fix (this pass, 2026-11-01) a raw probe with `_meta` on `initialize` and on `tools/list` returns the normal initialize result and the seven-tool page, and `id: 2.5` / `id: 1e999` return `-32600` with `id: null`.
 - Ran the MCP Python SDK's `ClientSession` (2.0.0, in the Hermes venv, Hermes configuration not loaded) against the shipped server twice: pre-fix it emitted `_meta: {}` and initialization failed; post-fix it completed initialize, listed the seven tools and made a successful tool call over `protocolVersion` `2024-11-05` with no upstream calls. This is SDK interoperability evidence, not a full configured Hermes session capture.
 - Source inspection and synthetic probes do not establish current upstream account state, stock, prices, selected delivery address or write semantics.
-- The earlier documentation/audit pass changed no runtime files. This pass (2026-11-01) did: `src/server.mjs` (metadata, ids, fatal decoding) and `scripts/stdio.test.mjs` (covering checks). Nothing else in `src/` or `scripts/` was touched; no new dependency, no transport change, no cart-write tool added.
+- The earlier documentation/audit pass changed no runtime files. This pass (2026-11-01) did:
+  `src/server.mjs` (metadata, ids, fatal decoding) and `scripts/stdio.test.mjs` (covering
+  checks), plus a separate cart-write follow-up the same day: `src/cart.mjs` (new, three
+  confirm-gated cart write tools) wired into `src/server.mjs`, with `scripts/cart.test.mjs`
+  (28 offline checks) and `scripts/cart-live.mjs` (gated live runner; executed once with
+  approval and blocked at the pre-read, zero mutations), and
+  `src/account.mjs` exporting its strict credential loader for reuse. No new dependency, no
+  transport change.
 
 ## Confirmed findings
 
@@ -40,7 +57,8 @@ strictness is unchanged. `scripts/stdio.test.mjs` grew the covering checks (now 
 passing, offline). **Installed-SDK regression taken after the repair:** MCP Python SDK 2.0.0
 in the Hermes venv (`~/.hermes/hermes-agent/venv`) ran initialize / tools/list / tools/call
 against the server and passed, negotiating `2024-11-05` with 7 tools and no upstream calls
-(`~/.hermes/workspace/mm-sdk-check.py`). `python3 -m pip show mcp` →
+(`~/.hermes/workspace/mm-sdk-check.py`; that count predates the three cart write tools added
+later the same day, so the current surface of 10 has no SDK run behind it). `python3 -m pip show mcp` →
 `WARNING: Package(s) not found: mcp` covers the system interpreter only, not that venv. The
 configured Hermes session is still **not** certified. Protocol-version handling is
 unchanged (`2024-11-05` echoed as a constant).

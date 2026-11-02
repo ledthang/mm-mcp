@@ -12,7 +12,8 @@ the server itself never logs in.
 > the Hermes venv completed initialize / tools/list / tools/call against this server (PASS,
 > `2024-11-05`, 7 tools, no upstream calls), but that loaded no Hermes configuration, so no
 > client connection — Hermes included — is certified, and the client configuration in §2
-> remains **illustrative**. See [../README.md](../README.md) and
+> remains **illustrative**. That run listed 7 tools: it predates the three cart write tools,
+> the page is 10 now, and the SDK run has not been repeated. See [../README.md](../README.md) and
 > [testing.md](testing.md).
 
 ## 1. Run it (nothing to install)
@@ -55,9 +56,10 @@ opened, so it is not confirmed working in Hermes. `_meta` on any method (includi
 `initialize`) is now accepted when it is an object, so the old `-32602` blocker that broke
 initializing clients is closed locally and unit-tested, and the MCP Python SDK 2.0.0 in the
 Hermes venv did complete initialize / tools/list / tools/call against this server (PASS,
-protocol `2024-11-05`, 7 tools, no upstream calls). That is an SDK handshake with no Hermes
-configuration loaded — not a Hermes session. Verify a connection yourself before treating any
-config here as working.
+protocol `2024-11-05`, 7 tools, no upstream calls — that count predates the three cart write
+tools, the surface is 10 now, and the SDK run has not been repeated). That is an SDK
+handshake with no Hermes configuration loaded — not a Hermes session. Verify a connection
+yourself before treating any config here as working.
 
 Timeouts worth knowing before you configure a client: one upstream request may take up to
 25 s, and `mm_search_products` makes two of them in sequence, so allow roughly 50 s for a

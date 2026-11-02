@@ -197,8 +197,8 @@ async function main() {
   await t("tools/list default params then cursor: catalog+account tools, no cursor", async () => {
     const c = await live();
     const a = await c.call({ jsonrpc: "2.0", id: 16, method: "tools/list" });
-    assert.deepEqual(a.result.tools.map((t) => t.name), ["mm_search_products", "mm_get_product", "mm_auth_status", "mm_get_delivery_context", "mm_list_addresses", "mm_get_cart", "mm_cart_summary"], "seven tools: 2 guest catalog + 5 authenticated read");
-    assert.equal(a.result.tools.length, 7, "exactly seven tools on one page");
+    assert.deepEqual(a.result.tools.map((t) => t.name), ["mm_search_products", "mm_get_product", "mm_auth_status", "mm_get_delivery_context", "mm_list_addresses", "mm_get_cart", "mm_cart_summary", "mm_add_to_cart", "mm_update_cart_item", "mm_remove_cart_item"], "ten tools: 2 guest catalog + 5 authenticated read + 3 authenticated write");
+    assert.equal(a.result.tools.length, 10, "exactly ten tools on one page");
     assert.ok(a.result.tools.every((t) => t.inputSchema.additionalProperties === false));
     const b = await c.call({ jsonrpc: "2.0", id: 17, method: "tools/list", params: { cursor: "next" } });
     assert.deepEqual(b.result.tools, a.result.tools); // same single page for any cursor string
@@ -389,7 +389,7 @@ async function main() {
     assert.equal(r.result.protocolVersion, PV, "metadata must not block initialize");
     assert.equal("error" in r, false);
     const l = await c.call({ jsonrpc: "2.0", id: 201, method: "tools/list" });
-    assert.equal(l.result.tools.length, 7, "session opened despite metadata");
+    assert.equal(l.result.tools.length, 10, "session opened despite metadata");
     c.stop();
   });
 
@@ -434,7 +434,7 @@ async function main() {
   await t("tools/list with valid _meta (bare and with cursor): same single page", async () => {
     const c = await live();
     const a = await c.call({ jsonrpc: "2.0", id: 220, method: "tools/list", params: { _meta: { trace: "a" } } });
-    assert.equal(a.result.tools.length, 7);
+    assert.equal(a.result.tools.length, 10);
     const b = await c.call({ jsonrpc: "2.0", id: 221, method: "tools/list", params: { cursor: "next", _meta: { trace: "b" } } });
     assert.deepEqual(b.result.tools, a.result.tools, "cursor + metadata: same single page");
     assert.equal((await c.call({ jsonrpc: "2.0", id: 222, method: "tools/list", params: { cursor: 42, _meta: {} } })).error.code, -32602, "bad cursor with metadata still -32602");

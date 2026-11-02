@@ -454,7 +454,9 @@ claiming the existing offline gate passes. No unrelated runtime/test edits made.
 
 The restricted worker results below are historical, not the current gate state.
 Primary host re-ran all six suites on 2026-11-01 under synthetic HOME/XDG:
-212 checks passed, two live-only checks skipped, exit 0. See [testing.md](testing.md).
+212 checks passed, two live-only checks skipped, exit 0. A seventh suite
+(`scripts/cart.test.mjs`, 20 checks) was added the same day, so the current gate is
+eight suites, 255 pass / 2 skip — see [testing.md](testing.md), which is authoritative.
 
 - Focused fake-only suite: `node scripts/auth-setup.test.mjs` passed 74/74 checks.
   Covers exact requests, no login cookies/authorization, CAPTCHA/config fail-closed,

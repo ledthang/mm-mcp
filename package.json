@@ -1,16 +1,18 @@
 {
   "name": "mm-mcp",
   "version": "0.1.0",
-  "description": "Minimal newline JSON-RPC 2.0 MCP stdio server for Mega Market (T1 core + T2 catalog search)",
+  "description": "Minimal newline JSON-RPC 2.0 MCP stdio server for Mega Market (T1 core + T2 catalog search + cart writes)",
   "type": "module",
   "engines": { "node": ">=22" },
   "scripts": {
     "start": "node src/server.mjs",
-    "test": "node scripts/auth-setup.test.mjs && node scripts/stdio.test.mjs && node scripts/catalog.test.mjs && MM_LIVE_PARSE= node scripts/account.test.mjs && node scripts/account-live.test.mjs && node scripts/catalog-live.test.mjs",
+    "test": "node scripts/auth-setup.test.mjs && node scripts/stdio.test.mjs && node scripts/catalog.test.mjs && MM_LIVE_PARSE= node scripts/account.test.mjs && node scripts/account-live.test.mjs && node scripts/catalog-live.test.mjs && node scripts/cart.test.mjs && node scripts/cart-live.test.mjs",
     "auth:setup": "node scripts/auth-setup.mjs",
     "live": "node scripts/catalog-live.mjs",
     "live:parse": "MM_LIVE_PARSE=1 node scripts/account.test.mjs",
-    "live:account": "node scripts/account-live.mjs"
+    "live:account": "node scripts/account-live.mjs",
+    "live:cart": "node scripts/cart-live.mjs",
+    "proof:cart": "MM_LIVE_PARSE=1 node scripts/cart-parse-proof.mjs"
   },
   "license": "UNLICENSED",
   "private": true

@@ -27,9 +27,11 @@ so inherited auth paths, proxy settings and `NODE_OPTIONS` cannot activate live 
 
 ## Assertions
 
-- Exactly the seven shipped read tools exist. No cart write, checkout, address
-  selection, recipe or nutrition tool is available. Unknown write calls fail
-  locally with JSON-RPC `-32602`, without upstream traffic.
+- Exactly the seven shipped read tools existed at capture time; three cart write tools were
+  added later on 2026-11-01 (surface is ten now). This walk still covers reads only, so
+  nothing here evidences a cart write. No checkout, address selection, recipe or nutrition
+  tool is available. Unknown write calls fail locally with JSON-RPC `-32602`, without
+  upstream traffic.
 - Synthetic profile requires six eggs and has two eggs in inventory. Generic
   product selection is ambiguous; exact SKU still cannot establish eggs per box.
   Unknown or mismatched conversions remain blocked. Only an explicit **synthetic**

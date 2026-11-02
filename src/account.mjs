@@ -492,5 +492,8 @@ export function createAccount({ fetchImpl = globalThis.fetch, env = process.env 
     }
   }
 
-  return { callTool };
+  // loadAuth is the same strict loader callTool uses (file + parent validation, per-call
+  // read, no cache): src/cart.mjs pulls the credential through it rather than building a
+  // second one. The token itself is never logged or echoed by either path.
+  return { callTool, loadAuth };
 }

@@ -7,13 +7,17 @@ and live-gate harnesses, and these documents.
 
 ```
 src/server.mjs     JSON-RPC framing, MCP dispatch, stdio loop     (no direct network:
-                                                                    catalog/account do the fetches)
+                                                                    catalog/account/cart do the fetches)
 src/catalog.mjs    guest catalog: search (CARD -> ENRICH) + exact detail (network)
 src/account.mjs    authenticated read: auth file + live proofs         (network)
+src/cart.mjs       authenticated cart WRITE: pre-read -> one mutation -> post-read (network;
+                   owns its own POST transport, reuses account.mjs's strict credential loader)
 scripts/
   auth-setup.mjs          operator login CLI (the only thing that logs in; writes a token)
   account-live.mjs        live account gate  + the bounded stdio harness (spawnGate)
   catalog-live.mjs        live guest catalog gate (reuses spawnGate)
+  cart-live.mjs           live cart WRITE gate (reuses spawnGate; needs explicit approval —
+                          run once 2026-11-01, blocked at the pre-read, zero mutations)
   *.test.mjs              offline suites (canned payloads / local children, no real endpoint)
   consumer-acceptance.mjs consumer-level acceptance run (loopback fixture, or live read-only)
   cart_contract_extract.py  extractor behind the cart-write research (needs an external
@@ -85,6 +89,42 @@ effect on the next call without restarting the server. Local credential problems
 detected **before** any request is made — the server does not discover a bad credential by
 failing a live call first.
 
+## Cart write flow (the three `mm_*_cart*` write tools)
+
+`src/cart.mjs` is the only place in this server that changes something upstream. Its shape is
+deliberately different from the read flows: a read can be re-issued freely, a write cannot.
+
+```
+tools/call mm_add_to_cart { sku, quantity, confirm }
+   1. check tool name + arguments (strict, additionalProperties false)  -> INVALID_ARGS, zero requests
+      a cart id in any spelling (cart_id / cartId / ...) is refused here, never forwarded
+   2. confirm gate: absent -> CONFIRM_REQUIRED, present-but-not-true -> NOT_CONFIRMED
+      either way: zero requests                                            (nothing dispatched)
+   3. credential via account.mjs's strict loader (reused, not re-implemented)
+                                                                -> REQUIRES_LOGIN, zero requests
+   4. intent guard (in-process Map, last 64 intents): identical intent already dispatched
+      -> answer from the recorded report, zero requests       (local duplicate protection only)
+   5. PRE-READ   customerCart (owner-bound)                    -> 1 request
+   6. validate against that pre-read (uid must exist for update/remove)
+   7. DISPATCH   exactly one mutation, one POST, 25 s deadline -> 1 request
+   8. POST-READ  customerCart again, fresh                     -> 1 request
+   9. verdict from the post-read only: applied | rejected | unknown, plus observed_state
+```
+
+- A mutation is never sent as GET, and never retried: an unknown outcome may already have
+  applied, and a retry of an unknown add is a possible double add.
+- There is no compensating/rollback mutation. If a write applied and the caller wants it
+  undone, that is a separate, explicitly confirmed call.
+- Absolute-vs-delta quantity, merge-vs-new-line, and quantity step/min/max are all
+  UNVERIFIED against this endpoint: the number is passed through unchanged and the post-read
+  says which shape was observed. No default constraint is invented.
+- `cart_id` is resolved internally and never echoed: the report says
+  `not exposed (owner-bound, resolved internally)`.
+- Ceiling ≈75 s per call (three sequential requests, 25 s each) — a 30 s client timeout is
+  too short for a write.
+- **Nothing here is live-verified:** every `applied` in the test suite came from a fake
+  transport. `scripts/cart-live.mjs` (gated, never run) is the only path to real evidence.
+
 ## Two contexts, never mixed
 
 - Guest tools send no `Authorization` header and report `context.authenticated: false`.
@@ -98,7 +138,8 @@ failing a live call first.
 | --- | --- | --- |
 | Client → server (stdio) | framing, JSON validity, ≤64 KiB lines, fatal UTF-8 per line (bad bytes are a Parse error, never U+FFFD), exact `initialize`, known method, `id` is a string or an integer, params keys inside the per-method allowlist, request-level `_meta` must be an object when present (then ignored), argument types and bounds | nothing: an unchecked frame is refused |
 | Server → GraphQL (guest) | one fixed origin, only the `store` header, 25 s deadline per request (search issues two in sequence, so up to ~50 s end to end), 2 MiB streamed-body cap per request, page shape, exact-SKU join, price cell validity, non-inverted prices | product data, prices, stock labels, promotion blobs — all reported as *observed* |
-| Server → GraphQL (account) | same origin/cap/per-request deadline, credential-file safety before the call, `Customer` proof and store cross-check after it, cart row/currency/quantity validity | cart lines, totals, addresses, store name — reported as *observed*, never recomputed |
+| Server → GraphQL (account read) | same origin/cap/per-request deadline, credential-file safety before the call, `Customer` proof and store cross-check after it, cart row/currency/quantity validity | cart lines, totals, addresses, store name — reported as *observed*, never recomputed |
+| Server → GraphQL (cart write) | same origin/cap/per-request deadline, `confirm: true` required before anything is dispatched, credential checked locally first, exactly one mutation per call, never retried, verdict taken from a fresh post-read and never from the mutation's HTTP 200 | whether the mutation applied, whether it merged into an existing line, whether the quantity was read as absolute or delta, which address was priced — all *observed* or reported `unknown`; nothing here is live-verified |
 | Credential file | regular file (not a symlink), owner = running user, mode exactly 0600, immediate parent a real (non-symlink) directory owned by the running user with no group/other access, ≤16 KiB, exactly two keys, bearer pattern, store pattern | that the token itself is valid or not — only upstream can say, and the server asks on every call |
 | Out to the caller | one envelope per request, fixed codes, no upstream bodies | the projected numbers, which carry `price_status` / `NOT verified` markers so their status travels with them |
 
@@ -144,15 +185,17 @@ state, or a saved `default_shipping` flag as proof of the delivery address in us
 | Upstream body cap | 2 MiB, enforced while streaming, not after buffering | `src/catalog.mjs`, `src/account.mjs` |
 | Catalog paging | 0-based `page_index` up to 40; `page_size` ∈ {10, 20, 24, 50} | `src/catalog.mjs` |
 | Address paging | 0-based `page_index` up to 40; `page_size` 1–20 | `src/account.mjs` |
-| Caching | none — every answer is a live read | both modules |
+| Caching | none — every answer is a live read; the cart intent guard is not a cache, it holds the last 64 dispatched intents in process memory to answer a duplicate call without a second mutation, and a restart clears it | all three modules |
 | Rate limiting / metrics | unimplemented | — |
-| Writes, from MCP | none reachable: no cart, address, session or cache mutation is exposed as a tool | `src/server.mjs`, both modules |
-| Writes, outside MCP | one path only: `scripts/auth-setup.mjs` sends one `SignIn` mutation upstream and writes the local credential file — operator-run, not client-invocable | `scripts/auth-setup.mjs` |
+| Writes, from MCP | three cart tools (`mm_add_to_cart` / `mm_update_cart_item` / `mm_remove_cart_item`), each gated on `confirm: true`, one mutation per call, never retried — **not live-verified**: every verdict so far comes from an injected fake. No address, session or cache mutation is exposed | `src/cart.mjs` |
+| Writes, outside MCP | two paths only: `scripts/auth-setup.mjs` sends one `SignIn` mutation upstream and writes the local credential file; `scripts/cart-live.mjs` would send one real cart add, but only under four explicit environment variables — it has been run once (2026-11-01) and dispatched nothing, because its pre-read failed. Both operator-run, neither client-invocable | `scripts/auth-setup.mjs`, `scripts/cart-live.mjs` |
 | `params._meta` | accepted on every method when it is an object, then ignored (never reaches a tool); a non-object `_meta` is `-32602`. Fixed on this pass, covered by `scripts/stdio.test.mjs` — no MCP client connection is certified | `src/server.mjs` |
 
 ## What would change this picture
 
-Nothing here is a promise. If HTTP transport, caching, an authenticated pricing view, or
-cart writes are ever added, they come with their own evidence and their own gate — the
-cart-write side of that is researched but deliberately **not shipped**; see
+Nothing here is a promise. If HTTP transport, caching, or an authenticated pricing view are
+ever added, they come with their own evidence and their own gate. The cart-write side is now
+shipped as three confirm-gated tools, but **unshipped in the evidence sense**: no cart write
+has ever reached the real endpoint from this repository, so all three carry
+`not live-verified` until `scripts/cart-live.mjs` is actually run. See
 [cart-write-contract.md](cart-write-contract.md).

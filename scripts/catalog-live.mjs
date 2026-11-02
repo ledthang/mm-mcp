@@ -25,9 +25,12 @@ import { spawnGate } from "./account-live.mjs";
 
 const SERVER = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "server.mjs");
 const PV = "2024-11-05";
+// The full published set (guest catalog + authenticated reads + cart writes). The gate
+// walks only the guest catalog tools; the rest must still be named exactly by tools/list.
 const TOOL_NAMES = [
   "mm_search_products", "mm_get_product", "mm_auth_status", "mm_get_delivery_context",
   "mm_list_addresses", "mm_get_cart", "mm_cart_summary",
+  "mm_add_to_cart", "mm_update_cart_item", "mm_remove_cart_item",
 ];
 const PRICE_STATUS = "catalog-observed-not-guaranteed-payable";
 // search answers with products+pagination; detail answers with a single product (no pagination)
@@ -36,7 +39,9 @@ const DETAIL_KEYS = ["context", "observed_at", "price_status", "product"];
 const URL_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
-const moneyOk = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
+// VND has no minor unit: every observed price cell is a whole number. A fractional or
+// non-numeric cell is malformed, never a price. Each cell is checked on its own.
+const moneyOk = (v) => Number.isSafeInteger(v) && v >= 0;
 const qtyOk = (v) => typeof v === "number" && Number.isFinite(v) && v > 0; // step may be fractional (0.5)
 const isoFresh = (s, spawnedAt) => {
   const t = Date.parse(s);
@@ -47,11 +52,16 @@ const rowOk = (p) =>
   Number.isSafeInteger(p.id) && p.id > 0
   && typeof p.sku === "string" && p.sku !== ""
   && typeof p.name === "string" && p.name !== ""
-  && typeof p.unit === "string" && p.unit !== ""
+  // unit_ecom is nullable upstream (observed null on real rows); null is a valid answer.
+  && (p.unit === null || (typeof p.unit === "string" && p.unit !== ""))
   && typeof p.stock_status === "string" && p.stock_status !== ""
   && typeof p.url_key === "string" && URL_KEY_RE.test(p.url_key)
   && qtyOk(p.quantity_step)
-  && moneyOk(p.price_vnd) && moneyOk(p.regular_price_vnd) && p.price_vnd <= p.regular_price_vnd;
+  // Each price cell is checked on its own. final > regular is REAL upstream data
+  // (live proof 2026-11-01, SKU351030_23510302: final 55000 / regular 52000 / discount 0),
+  // so no final<=regular invariant here: it would fabricate a discount upstream never gave
+  // and fail the whole page for one honest row.
+  && moneyOk(p.price_vnd) && moneyOk(p.regular_price_vnd);
 
 // Search/detail projections: exact top-level keys, guest context for the configured
 // store, valid rows, no secret-shaped text. Search adds internally consistent pagination.
@@ -146,8 +156,17 @@ export async function runGate({ store, cmd, env }) {
     assert.ok(!page0.isError, "guest search must succeed: " + page0.text.slice(0, 160));
     proj0 = JSON.parse(page0.text);
     searchOk(proj0, store, st.spawnedAt, 0, 24);
-    const seen = proj0.products.map((p) => `${p.sku} ${p.price_vnd}${p.price_vnd < p.regular_price_vnd ? "/" + p.regular_price_vnd : ""}`);
-    return { rows: proj0.products.length, total_count: proj0.pagination.total_count, total_pages: proj0.pagination.total_pages, store, observed: seen };
+    // both cells reported independently: no "/" only-when-discounted framing, an equal pair
+    // and a final-above-regular pair are both facts the gate must show as-is
+    const seen = proj0.products.map((p) => `${p.sku} ${p.price_vnd}/${p.regular_price_vnd}`);
+    return {
+      rows: proj0.products.length,
+      total_count: proj0.pagination.total_count,
+      total_pages: proj0.pagination.total_pages,
+      units_null: proj0.products.filter((p) => p.unit === null).length,
+      store,
+      observed: seen,
+    };
   });
 
   const page1 = await st.call(5, "mm_search_products", { query: "trứng", page_index: 1, page_size: 24 });

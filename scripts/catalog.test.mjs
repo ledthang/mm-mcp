@@ -55,6 +55,26 @@ const C = { card: cardItem(69678, "197560_21975608", "Trứng gà ta Vĩnh Thàn
             enrich: enrichItem("197560_21975608", 42400, 42400) };
 const OK_PAGE = [CARD([A.card, B.card, C.card]), ENR([A.enrich, B.enrich, C.enrich])];
 
+// Real CARD answer, search "ức gà", store b2c_70010_vi, pageSize 50 (2026-11-01 capture,
+// public guest data; full response kept out of the repo as mm-chicken-card-repro.json).
+// 11 items: 4 answer unit_ecom "Gói"/"Ký", 7 answer unit_ecom null. mm_qty_step is 1 or 0.5.
+// Nothing here invents a unit — null is what upstream says the unit is not.
+const CHICKEN_CAPTURE = [
+  cardItem(70192, "137953_21379536", "Ức phi lê gà công nghiệp C.P VN, 1kg", "Gói", 1, "IN_STOCK", "uc-phi-le-ga-cn-c-p-21379536-137953"),
+  cardItem(70206, "351030_23510302", "Ức phi lê gà CP", null, 1, "IN_STOCK", "uc-phi-le-ga-khay-23510302-351030"),
+  cardItem(108102, "349055_23490550", "Ức phi lê gà MM WH85", null, 1, "IN_STOCK", "frz-chicken-breast-wrf-108102"),
+  cardItem(117198, "237986_22379863", "Ức phi lê gà công nghiệp - VLT", "Ký", 0.5, "IN_STOCK", "uc-phi-le-ga-cn-vlt-22379863-237986"),
+  cardItem(285890, "401651_24016513", "Ức phi lê gà công nghiệp We Are Fresh, 500g", null, 1, "IN_STOCK", "uc-phi-le-ga-cn-500g-24016513-401651"),
+  cardItem(285891, "401652_24016520", "Ức phi lê gà công nghiệp We Are Fresh, 1kg", null, 1, "IN_STOCK", "uc-phi-le-ga-cn-1kg-24016520-401652"),
+  cardItem(292353, "408973_24089739", "Ức phi lê gà CP", null, 0.5, "IN_STOCK", "uc-phile-ga-tui-cp-24089739-408973"),
+  cardItem(345059, "413581_24135818", "Ức phi lê gà công nghiệp không da đông lạnh Tori", null, 0.5, "IN_STOCK", "uc-phile-ga-cn-k-da-24135818-413581"),
+  cardItem(94622, "191953_21919534", "Xương ức gà We Are Fresh, 1kg", "Gói", 1, "IN_STOCK", "xuong-uc-ga-mm-1kg-21919534-191953"),
+  cardItem(94627, "354022_23540224", "Xương ức gà công nghiệp đông lạnh We Are Fresh", null, 1, "IN_STOCK", "xuong-uc-ga-mm-23540224-354022"),
+  cardItem(117200, "237985_22379856", "Xương ức gà VLT", "Ký", 0.5, "IN_STOCK", "xuong-uc-ga-vlt-22379856-2237985"),
+];
+// Fixture prices (the CARD stage carries none): enough for the ENRICH join, nothing claimed.
+const chickenEnrich = () => CHICKEN_CAPTURE.map((c, i) => enrichItem(c.sku, 30000 + i * 1000, 30000 + i * 1000));
+
 // --- detail fixture: the captured ProductPage answer (public guest data, store
 // b2c_10010_vi), pared to the fields the projection reads. No bulky dump.
 const DETAIL_URL_KEY = "trung-ga-tuoi-cp-hop-10-qua-120167";
@@ -306,7 +326,7 @@ async function main() {
     assert.equal(calls.length, 1);
   });
 
-  await t("malformed price: fail closed (USD, missing, fraction, negative, final>regular)", async () => {
+  await t("malformed price: fail closed (USD, string, fraction, negative, null)", async () => {
     const bad = [
       { currency: "USD", value: 31000 },
       { currency: "VND", value: "31000" },
@@ -322,11 +342,16 @@ async function main() {
       assert.equal(out.isError, true, "must fail closed: " + JSON.stringify(fin));
       assert.match(text(out), /^PRICE_INVALID: 120167_21201677 malformed price$/);
     }
+    // final ABOVE regular is not a defect: live 2026-11-01, 351030_23510302 answers
+    // final 55000 / regular 52000 / discount 0. Copying both beats killing the page.
     const e = structuredClone(A.enrich);
     e.price_range.maximum_price.final_price.value = 32000; // above regular 31000
     const { run } = mkFetch([OK_PAGE[0], ENR([e, B.enrich, C.enrich])]);
     const out = await run();
-    assert.match(text(out), /^PRICE_INVALID: 120167_21201677 final above regular$/);
+    assert.equal(out.isError, undefined, text(out));
+    const p = JSON.parse(text(out));
+    const row = p.products.find((x) => x.sku === "120167_21201677");
+    assert.deepEqual([row.price_vnd, row.regular_price_vnd], [32000, 31000], "both cells copied as observed");
   });
 
   await t("argument validation: INVALID_ARGS, zero network", async () => {
@@ -599,7 +624,7 @@ async function main() {
     assert.equal(calls.length, 1);
   });
 
-  await t("detail: malformed money -> PRICE_INVALID (currency, type, fraction, negative, missing, final>regular)", async () => {
+  await t("detail: malformed money -> PRICE_INVALID (currency, type, fraction, negative, missing)", async () => {
     const badMoneys = [
       { currency: "USD", value: 31000 },
       { currency: "VND", value: "31000" },
@@ -625,7 +650,8 @@ async function main() {
     const it2 = structuredClone(detailItem());
     it2.price_range.maximum_price.final_price = { currency: "VND", value: 32000, __typename: "Money" }; // above regular 31000
     const r2 = mkFetch([DETAIL([it2])]);
-    assert.match(text(await r2.runDetail({ url_key: DETAIL_URL_KEY })), /^PRICE_INVALID: 120167_21201677 final above regular$/);
+    const out2 = JSON.parse(text(await r2.runDetail({ url_key: DETAIL_URL_KEY }))); // real upstream shape: copied, not refused
+    assert.deepEqual([out2.product.price_vnd, out2.product.regular_price_vnd], [32000, 31000], "final above regular is upstream data");
   });
 
   await t("detail: incomplete upstream item -> BAD_UPSTREAM_DATA", async () => {
@@ -756,6 +782,50 @@ async function main() {
     assert.match(badArgs.result.content[0].text, /^INVALID_ARGS/);
     const notif = await dispatch(st, JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }));
     assert.equal(notif, null, "notifications: no reply, no dispatch");
+  });
+
+  // --- regression (2026-11-01): unit_ecom is nullable upstream metadata -------------------
+  // Observed failure: every "ức gà" search died with BAD_UPSTREAM_DATA because 7 of the
+  // 11 real cards answer unit_ecom: null and the projection demanded a non-empty string.
+  // One absent label killed all 11 products. Null must project as null; the rest of the
+  // strictness stays (missing key, wrong type, empty string are still malformed).
+  await t("search ức gà real capture: all 11 items, unit null preserved", async () => {
+    const { cat, calls } = mkFetch([CARD(CHICKEN_CAPTURE, 11, 1), ENR(chickenEnrich())], { MM_STORE_CODE: "b2c_70010_vi" });
+    const res = await cat.callTool("mm_search_products", { query: "ức gà", page_size: 50 });
+    assert.equal(res.isError, undefined, text(res));
+    const p = payload(res);
+    assert.equal(p.products.length, 11, "all 11 observed products");
+    assert.deepEqual(p.products.map((x) => x.sku), CHICKEN_CAPTURE.map((x) => x.sku), "capture order kept");
+    // unit is the upstream value byte-for-byte: null stays null, "Gói"/"Ký" stay strings.
+    assert.deepEqual(p.products.map((x) => x.unit), CHICKEN_CAPTURE.map((x) => x.unit_ecom));
+    assert.equal(p.products.filter((x) => x.unit === null).length, 7, "7 nulls, not invented");
+    assert.deepEqual(p.pagination, { total_count: 11, total_pages: 1, page_index: 0, page_size: 50 }, "pagination honest");
+    assert.equal(calls.length, 2, "CARD then ENRICH, nothing else");
+  });
+
+  await t("search: unit null valid, missing key / wrong type / empty string still malformed", async () => {
+    for (const u of ["", 500, true, [], {}]) {
+      const { cat } = mkFetch([CARD([cardItem(1, "S1", "n", u)], 1, 1), ENR([enrichItem("S1", 1000, 1000)])]);
+      const res = await cat.callTool("mm_search_products", { query: "x" });
+      assert.equal(res.isError, true, `unit ${JSON.stringify(u)} must fail`);
+      assert.match(text(res), /^BAD_UPSTREAM_DATA/, `unit ${JSON.stringify(u)} -> ${text(res).slice(0, 60)}`);
+    }
+    // key absent entirely (not null): upstream shape unknown -> malformed, fail closed
+    const item = { id: 1, sku: "S1", name: "n", mm_qty_step: 1, stock_status: "IN_STOCK", url_key: "s1" };
+    assert.ok(!("unit_ecom" in item), "fixture really omits the key");
+    const res = await mkFetch([CARD([item], 1, 1), ENR([enrichItem("S1", 1000, 1000)])]).cat.callTool("mm_search_products", { query: "x" });
+    assert.match(text(res), /^BAD_UPSTREAM_DATA/, "missing unit key is malformed");
+  });
+
+  await t("detail: unit null preserved, missing key / wrong type still malformed", async () => {
+    const { cat } = mkFetch([DETAIL([detailItem({ unit_ecom: null })])]);
+    const res = await cat.callTool("mm_get_product", { url_key: DETAIL_URL_KEY });
+    assert.equal(res.isError, undefined, text(res));
+    assert.equal(payload(res).product.unit, null, "same nullable contract as search");
+    for (const u of ["", 500, true, {}, []]) {
+      const r = await mkFetch([DETAIL([detailItem({ unit_ecom: u })])]).cat.callTool("mm_get_product", { url_key: DETAIL_URL_KEY });
+      assert.match(text(r), /^BAD_UPSTREAM_DATA/, `detail unit ${JSON.stringify(u)} -> ${text(r).slice(0, 60)}`);
+    }
   });
 
   console.error(`\n${checks - failures}/${checks} checks passed`);

@@ -12,13 +12,16 @@
 import { pathToFileURL } from "node:url";
 import { createCatalog, TOOLS as CATALOG_TOOLS } from "./catalog.mjs";
 import { createAccount, TOOLS as ACCOUNT_TOOLS } from "./account.mjs";
+import { createCart, TOOLS as CART_TOOLS } from "./cart.mjs";
 
 const catalog = createCatalog(); // guest view: native fetch, explicit MM_STORE_CODE per call
 const account = createAccount(); // auth read slice: auth file + live proof per call, no cache
+const cart = createCart(); // auth WRITE slice: one owner-bound mutation per dispatched call
 
-const TOOLS = [...CATALOG_TOOLS, ...ACCOUNT_TOOLS];
+const TOOLS = [...CATALOG_TOOLS, ...ACCOUNT_TOOLS, ...CART_TOOLS];
 const ACCOUNT_NAMES = new Set(ACCOUNT_TOOLS.map((t) => t.name));
-const implFor = (name) => (ACCOUNT_NAMES.has(name) ? account : catalog);
+const CART_NAMES = new Set(CART_TOOLS.map((t) => t.name));
+const implFor = (name) => (CART_NAMES.has(name) ? cart : ACCOUNT_NAMES.has(name) ? account : catalog);
 
 const PROTOCOL_VERSION = "2024-11-05";
 const MAX_LINE_BYTES = 64 * 1024;

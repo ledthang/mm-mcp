@@ -87,6 +87,11 @@ const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const isInt = (v, min, max) => Number.isInteger(v) && v >= min && v <= max;
 const hasControl = (s) => /[\u0000-\u001f\u007f]/.test(s);
 const moneyOk = (m) => isObj(m) && m.currency === "VND" && Number.isSafeInteger(m.value) && m.value >= 0;
+// unit_ecom is nullable upstream metadata: the real 2026-11-01 answer for "ức gà"
+// (store b2c_70010_vi) carries unit_ecom: null on 7 of 11 cards. null is what upstream
+// says ("no unit label") -> project null. A missing key, a non-string or an empty string
+// is a shape never observed -> malformed. Never invent "Kg"/"Hộp" from names or step.
+const unitOk = (v) => v === null || (typeof v === "string" && v !== "");
 
 // Every failure is exactly one fixed code (+ optional safe detail): raw upstream bodies,
 // queries and any account-looking content never reach the caller. Success and failure use
@@ -227,7 +232,7 @@ export function createCatalog({ fetchImpl = globalThis.fetch, env = process.env 
       if (!isObj(it) || typeof it.sku !== "string" || it.sku === "") throw new CatalogError("BAD_UPSTREAM_DATA", "card item sku");
       if (!isInt(it.id, 0, Number.MAX_SAFE_INTEGER)) throw new CatalogError("BAD_UPSTREAM_DATA", "card item id");
       if (typeof it.name !== "string" || it.name === "") throw new CatalogError("BAD_UPSTREAM_DATA", "card item name");
-      if (typeof it.unit_ecom !== "string" || it.unit_ecom === "") throw new CatalogError("BAD_UPSTREAM_DATA", "card item unit_ecom");
+      if (!unitOk(it.unit_ecom)) throw new CatalogError("BAD_UPSTREAM_DATA", "card item unit_ecom"); // null is a valid answer
       if (!Number.isFinite(it.mm_qty_step) || it.mm_qty_step <= 0) throw new CatalogError("BAD_UPSTREAM_DATA", "card item mm_qty_step");
       if (typeof it.stock_status !== "string" || it.stock_status === "") throw new CatalogError("BAD_UPSTREAM_DATA", "card item stock_status");
       // slug is kept as-is (validated, never invented): it is what mm_get_product needs for
@@ -255,7 +260,9 @@ export function createCatalog({ fetchImpl = globalThis.fetch, env = process.env 
       const fin = isObj(mp) ? mp.final_price : null;
       const reg = isObj(mp) ? mp.regular_price : null;
       if (!moneyOk(fin) || !moneyOk(reg)) throw new CatalogError("PRICE_INVALID", `${it.sku} malformed price`);
-      if (fin.value > reg.value) throw new CatalogError("PRICE_INVALID", `${it.sku} final above regular`);
+      // final > regular is REAL upstream data, not a defect to police. Live proof (2026-11-01,
+      // store b2c_70010_vi): ENRICH answers 351030_23510302 as final 55000 / regular 52000 /
+      // discount 0. Refusing the row, and so the whole page, for it was an invented invariant.
       const promo = isObj(e.dnr_price_search_page) && typeof e.dnr_price_search_page.event_name === "string" ? e.dnr_price_search_page.event_name : null;
       return {
         id: it.id,
@@ -322,14 +329,15 @@ export function createCatalog({ fetchImpl = globalThis.fetch, env = process.env 
       throw new CatalogError("BAD_UPSTREAM_DATA", "product url_key");
     }
     if (typeof it.name !== "string" || it.name === "") throw new CatalogError("BAD_UPSTREAM_DATA", "product name");
-    if (typeof it.unit_ecom !== "string" || it.unit_ecom === "") throw new CatalogError("BAD_UPSTREAM_DATA", "product unit_ecom");
+    if (!unitOk(it.unit_ecom)) throw new CatalogError("BAD_UPSTREAM_DATA", "product unit_ecom"); // null is a valid answer, same contract as search
     if (!Number.isFinite(it.mm_qty_step) || it.mm_qty_step <= 0) throw new CatalogError("BAD_UPSTREAM_DATA", "product mm_qty_step");
     if (typeof it.stock_status !== "string" || it.stock_status === "") throw new CatalogError("BAD_UPSTREAM_DATA", "product stock_status");
     const reg = isObj(it.price) && isObj(it.price.regularPrice) ? it.price.regularPrice.amount : null;
     const mp = isObj(it.price_range) ? it.price_range.maximum_price : null;
     const fin = isObj(mp) ? mp.final_price : null;
     if (!moneyOk(reg) || !moneyOk(fin)) throw new CatalogError("PRICE_INVALID", `${it.sku} malformed price`);
-    if (fin.value > reg.value) throw new CatalogError("PRICE_INVALID", `${it.sku} final above regular`);
+    // same as search: final above regular is upstream's own answer (351030_23510302:
+    // regularPrice 52000, maximum final 55000, discount 0) -> copied as observed, not refused
     return {
       product: {
         id: it.id,
